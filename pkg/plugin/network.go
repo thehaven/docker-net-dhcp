@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/mitchellh/mapstructure"
 	log "github.com/sirupsen/logrus"
@@ -93,6 +95,65 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	// containers on the same network (BUG-7 fix).
 	// The hostname is also propagated for DNS registration regardless of MAC source.
 	seedName, hostname := p.popPendingContainer(r.NetworkID)
+
+	if seedName == "" {
+		// FALLBACK: If the pending queue is empty (e.g. container restart or plugin
+		// restart during create), look up the container using this endpoint.
+		// Since CreateEndpoint is called before the container is fully joined,
+		// we first search by NetworkID and EndpointID in the network's container list.
+		
+		findInNetwork := func() bool {
+			n, err := p.docker.NetworkInspect(ctx, r.NetworkID, network.InspectOptions{Verbose: true})
+			if err != nil { return false }
+			for ctrID, epInfo := range n.Containers {
+				if epInfo.EndpointID == r.EndpointID {
+					inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+					defer cancel()
+					ctr, err := p.docker.ContainerInspect(inspectCtx, ctrID)
+					if err == nil {
+						seedName = strings.TrimPrefix(ctr.Name, "/")
+						hostname = ctr.Config.Hostname
+						if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
+							hostname = seedName
+						}
+						return true
+					}
+				}
+			}
+			return false
+		}
+
+		if !findInNetwork() {
+			// DEEP FALLBACK: List all containers and find the one connected to this network with this endpoint.
+			ctrs, err := p.docker.ContainerList(ctx, container.ListOptions{})
+			if err == nil {
+				for _, c := range ctrs {
+					if settings, ok := c.NetworkSettings.Networks[r.NetworkID]; ok {
+						if settings.EndpointID == r.EndpointID {
+							inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+							ctr, err := p.docker.ContainerInspect(inspectCtx, c.ID)
+							cancel()
+							if err == nil {
+								seedName = strings.TrimPrefix(ctr.Name, "/")
+								hostname = ctr.Config.Hostname
+								if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
+									hostname = seedName
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if seedName != "" {
+			reqLog.WithFields(log.Fields{
+				"container": seedName,
+				"hostname":  hostname,
+			}).Debug("Resolved container info via fallback API lookup")
+		}
+	}
 
 	// Store hostname in joinHints so Join can pass it to DHCP client for
 	// DNS registration (Option 12 + Option 81).

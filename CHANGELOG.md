@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-03-17
+
+### Fixed
+
+- **DHCP lease stability**: Removed the `-R` flag from background `udhcpc` clients to prevent lease release on plugin stop/restart.
+- **Incomplete DHCP event handling**: Updated `dhcpManager` to process `bound` events during renewal cycles and implemented logging for `deconfig`, `leasefail`, and `nak` events.
+- **DHCP failure visibility**: Updated `udhcpc-handler` to encode failure events as JSON for plugin consumption.
+- **Improved safety**: Added nil checks for network handles during IP renewal to prevent panics during partial failures.
+
 ## [1.0.0] - 2026-03-17
 
 Fork of [devplayer0/docker-net-dhcp](https://github.com/devplayer0/docker-net-dhcp) updated and hardened for production use.

@@ -81,8 +81,6 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 
 	if opts.Once {
 		c.cmd.Args = append(c.cmd.Args, "-q")
-	} else {
-		c.cmd.Args = append(c.cmd.Args, "-R")
 	}
 
 	if opts.Hostname != "" {
@@ -118,6 +116,11 @@ func (c *DHCPClient) Start() (chan Event, error) {
 
 	events := make(chan Event)
 	go func() {
+		// Closing the channel signals to processEvents that the udhcpc process
+		// has exited (pipe EOF). Without this close, processEvents would spin
+		// forever on the zero-value receive from an unclosed closed channel,
+		// silently preventing any further DHCP renewal.
+		defer close(events)
 		scanner := bufio.NewScanner(c.eventPipe)
 		for scanner.Scan() {
 			log.WithField("line", string(scanner.Bytes())).Trace("udhcpc handler line")

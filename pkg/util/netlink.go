@@ -11,7 +11,7 @@ import (
 
 func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns.NsHandle, error) {
 	var err error
-	nsChan := make(chan netns.NsHandle)
+	nsChan := make(chan netns.NsHandle, 1)
 	go func() {
 		for {
 			var ns netns.NsHandle
@@ -20,8 +20,12 @@ func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns
 				nsChan <- ns
 				return
 			}
-
-			time.Sleep(interval)
+			// Respect context cancellation so the goroutine does not leak.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 
@@ -39,7 +43,7 @@ func AwaitNetNS(ctx context.Context, path string, interval time.Duration) (netns
 
 func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, interval time.Duration) (netlink.Link, error) {
 	var err error
-	linkChan := make(chan netlink.Link)
+	linkChan := make(chan netlink.Link, 1)
 	go func() {
 		for {
 			var link netlink.Link
@@ -48,8 +52,12 @@ func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, in
 				linkChan <- link
 				return
 			}
-
-			time.Sleep(interval)
+			// Respect context cancellation so the goroutine does not leak.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
 		}
 	}()
 

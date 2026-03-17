@@ -47,6 +47,15 @@
                 "bind",
                 "rshared"
             ]
+        },
+        {
+            "source": "/var/run/docker/netns",
+            "destination": "/var/run/docker/netns",
+            "type": "bind",
+            "options": [
+                "bind",
+                "rshared"
+            ]
         }
     ],
     "linux": {
