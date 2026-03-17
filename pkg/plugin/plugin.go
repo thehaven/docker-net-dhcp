@@ -1,15 +1,20 @@
 package plugin
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types/events"
 	docker "github.com/docker/docker/client"
 	"github.com/gorilla/handlers"
 	"github.com/mitchellh/mapstructure"
+	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
 	"github.com/devplayer0/docker-net-dhcp/pkg/util"
@@ -18,7 +23,7 @@ import (
 // DriverName is the name of the Docker Network Driver
 const DriverName string = "net-dhcp"
 
-const defaultLeaseTimeout = 10 * time.Second
+const defaultLeaseTimeout = 30 * time.Second
 
 var driverRegexp = regexp.MustCompile(`^ghcr\.io/devplayer0/docker-net-dhcp:.+$`)
 
@@ -34,6 +39,8 @@ type DHCPNetworkOptions struct {
 	LeaseTimeout    time.Duration `mapstructure:"lease_timeout"`
 	IgnoreConflicts bool          `mapstructure:"ignore_conflicts"`
 	SkipRoutes      bool          `mapstructure:"skip_routes"`
+	MacSeedSource   string        `mapstructure:"mac_seed_source"`
+	MacFormat       string        `mapstructure:"mac_format"`
 }
 
 func decodeOpts(input interface{}) (DHCPNetworkOptions, error) {
@@ -70,28 +77,45 @@ type Plugin struct {
 	docker *docker.Client
 	server http.Server
 
+	sync.RWMutex
 	joinHints      map[string]joinHint
 	persistentDHCP map[string]*dhcpManager
+
+	cache *NetworkCache
+	
+	// Ordered Queue of recently created container names for deterministic matching
+	creationQueue []string
 }
 
 // NewPlugin creates a new Plugin
 func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	client, err := docker.NewClientWithOpts(
 		docker.WithAPIVersionNegotiation(),
-		docker.WithTimeout(2*time.Second),
 		docker.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
 
-	p := Plugin{
+	p := &Plugin{
 		awaitTimeout: awaitTimeout,
 
 		docker: client,
 
 		joinHints:      make(map[string]joinHint),
 		persistentDHCP: make(map[string]*dhcpManager),
+
+		cache: NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
+		
+		creationQueue: make([]string, 0),
 	}
+
+	// First reconciliation (immediate) to populate cache for recovery
+	p.cache.Reconcile(context.Background(), client, 0)
+
+	// Background tasks
+	go p.cache.ReconcileLoop(context.Background(), client, 10*time.Second)
+	go p.Recover(context.Background())
+	go p.watchDockerEvents(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/NetworkDriver.GetCapabilities", p.apiGetCapabilities)
@@ -110,7 +134,7 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		Handler: handlers.CustomLoggingHandler(nil, mux, util.WriteAccessLog),
 	}
 
-	return &p, nil
+	return p, nil
 }
 
 // Listen starts the plugin server
@@ -134,4 +158,38 @@ func (p *Plugin) Close() error {
 	}
 
 	return nil
+}
+
+func (p *Plugin) watchDockerEvents(ctx context.Context) {
+	log.Info("Starting Docker event listener...")
+	
+	msgChan, errChan := p.docker.Events(ctx, events.ListOptions{})
+
+	for {
+		select {
+		case msg := <-msgChan:
+			if msg.Type == "container" && msg.Action == "create" {
+				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
+				log.WithField("name", name).Debug("Container created, adding to queue")
+				
+				p.Lock()
+				p.creationQueue = append(p.creationQueue, name)
+				// Keep queue small
+				if len(p.creationQueue) > 10 {
+					p.creationQueue = p.creationQueue[1:]
+				}
+				p.Unlock()
+			}
+		case err := <-errChan:
+			if err != nil && ctx.Err() == nil {
+				log.WithError(err).Error("Docker event listener error, restarting in 5s...")
+				time.Sleep(5 * time.Second)
+				go p.watchDockerEvents(ctx)
+				return
+			}
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }

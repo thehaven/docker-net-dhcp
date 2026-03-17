@@ -17,9 +17,9 @@
             ]
         },
         {
-            "description": "Log level",
+            "description": "Timeout for awaiting container readiness",
             "name": "AWAIT_TIMEOUT",
-            "value": "10s",
+            "value": "30s",
             "settable": [
                 "value"
             ]
@@ -37,6 +37,15 @@
             "type": "bind",
             "options": [
                 "bind"
+            ]
+        },
+        {
+            "source": "/var/lib/docker-net-dhcp",
+            "destination": "/var/lib/docker-net-dhcp",
+            "type": "bind",
+            "options": [
+                "bind",
+                "rshared"
             ]
         }
     ],

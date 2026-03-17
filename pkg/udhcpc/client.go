@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"runtime"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/vishvananda/netns"
 
 	"github.com/devplayer0/docker-net-dhcp/pkg/util"
 )
@@ -51,10 +49,32 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	if opts.V6 {
 		path = "udhcpc6"
 	}
+
+	var cmd *exec.Cmd
+	if opts.Namespace != "" {
+		// Use nsenter to securely execute udhcpc inside the container's namespace
+		cmd = exec.Command("nsenter", "--net="+opts.Namespace, path, "-f", "-i", iface, "-s", opts.HandlerScript)
+	} else {
+		cmd = exec.Command(path, "-f", "-i", iface, "-s", opts.HandlerScript)
+	}
+
 	c := &DHCPClient{
 		Opts: opts,
-		// Foreground, set interface and handler "script"
-		cmd: exec.Command(path, "-f", "-i", iface, "-s", opts.HandlerScript),
+		cmd:  cmd,
+	}
+
+	if opts.Once {
+		// Initial lease acquisition: fast retries, limited attempts
+		// -t 5: retry 5 times before giving up
+		// -T 3: wait 3 seconds between retries
+		// -A 5: wait 5 seconds before retrying after failure
+		c.cmd.Args = append(c.cmd.Args, "-t", "5", "-T", "3", "-A", "5")
+	} else {
+		// Persistent client: relaxed settings to avoid DHCP server flooding
+		// No -t: retry forever (container needs to maintain lease)
+		// -T 5: wait 5 seconds between retries
+		// -A 30: wait 30 seconds after failure before retrying (prevents thundering herd)
+		c.cmd.Args = append(c.cmd.Args, "-T", "5", "-A", "30")
 	}
 
 	stderrPipe, err := c.cmd.StderrPipe()
@@ -105,31 +125,6 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 
 // Start starts udhcpc(6)
 func (c *DHCPClient) Start() (chan Event, error) {
-	if c.Opts.Namespace != "" {
-		// Lock the OS Thread so we don't accidentally switch namespaces
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		origNS, err := netns.Get()
-		if err != nil {
-			return nil, fmt.Errorf("failed to open current network namespace: %w", err)
-		}
-		defer origNS.Close()
-
-		ns, err := netns.GetFromPath(c.Opts.Namespace)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open network namespace `%v`: %w", c.Opts.Namespace, err)
-		}
-		defer ns.Close()
-
-		if err := netns.Set(ns); err != nil {
-			return nil, fmt.Errorf("failed to enter network namespace: %w", err)
-		}
-
-		// Make sure we go back to the old namespace when we return
-		defer netns.Set(origNS)
-	}
-
 	if err := c.cmd.Start(); err != nil {
 		return nil, err
 	}

@@ -9,9 +9,10 @@ COPY pkg/ ./pkg/
 RUN mkdir bin/ && go build -o bin/ ./cmd/...
 
 
-FROM alpine:3.14
+FROM alpine:3.21
 
-RUN mkdir -p /run/docker/plugins
+RUN apk add --no-cache util-linux && \
+    mkdir -p /run/docker/plugins
 
 COPY --from=builder /usr/local/src/docker-net-dhcp/bin/net-dhcp /usr/sbin/
 COPY --from=builder /usr/local/src/docker-net-dhcp/bin/udhcpc-handler /usr/lib/net-dhcp/udhcpc-handler

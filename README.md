@@ -171,8 +171,28 @@ Note:
  - By default, a bridge can only be used for a single DHCP network. There is additionally a check to see if a bridge is
 	 is used by any other Docker networks. To disable this check (it's also possible this check might mistakenly detect a
    conflict), pass `-o ignore_conflicts=true` when creating the network.
- - `docker-net-dhcp` will try to copy static routes from the host bridge to the container. To disable this behaviour,
-   pass `-o skip_routes=true` when creating the network.
+  - `docker-net-dhcp` will try to copy static routes from the host bridge to the container. To disable this behaviour,
+    pass `-o skip_routes=true` when creating the network.
+
+### Deterministic MAC and IP Addresses
+
+The plugin automatically generates deterministic MAC addresses (and consequently stable IPs from your DHCP server) for containers based on a seed. This eliminates the need for manual `--mac-address` configuration in most scenarios. **User-specified MAC addresses via `--mac-address` will always take precedence.**
+
+You can control how the seed is generated using `-o mac_seed_source=<source>` during network creation, where `<source>` is one of:
+- `hostname`: Uses the container's hostname.
+- `container_name`: Uses the container's name.
+- `fallback`: Generates a stable hash based on Network ID and Endpoint ID (Default if unspecified).
+
+You can also control the MAC format via `-o mac_format=<format>` (options: `colon`, `hyphen`, `dot`).
+
+A CLI tool is included (`docker-net-dhcp-macgen`) to help pre-calculate MAC addresses for DNS/DHCP reservations in infrastructure automation scripts.
+
+### Persistence and Zero-Interruption Upgrades
+
+The plugin maintains a local persistent cache of active networks and endpoints in `/var/lib/docker-net-dhcp/networks.json`. This allows the plugin to:
+1. **Survive restarts**: Automatically re-adopt existing containers and resume DHCP lease renewals without network interruption.
+2. **Zero-API Hot Path**: Avoid deadlocks during Docker daemon startup by using local state instead of blocking Docker API calls.
+3. **Seamless Upgrades**: You can upgrade the plugin using `docker plugin upgrade` without losing connectivity for existing containers.
 
 ## Debugging
 
