@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -183,28 +182,20 @@ func (m *dhcpManager) findPID(ctx context.Context) (int, error) {
 }
 
 func (m *dhcpManager) Start(ctx context.Context) error {
-	// ZERO-API PATH RESOLUTION
+	// Build the primary namespace path from the SandboxKey.
 	if strings.HasPrefix(m.joinReq.SandboxKey, "/") {
 		m.nsPath = m.joinReq.SandboxKey
 	} else {
 		m.nsPath = fmt.Sprintf("/var/run/docker/netns/%s", m.joinReq.SandboxKey)
 	}
 
-	// CHECK FOR MOUNT ACCESS: If the plugin cannot see /var/run/docker/netns,
-	// fall back to /proc/<pid>/ns/net using the container's host PID.
-	if _, err := os.Stat(m.nsPath); err != nil {
-		log.WithFields(m.logFields(false)).WithError(err).WithField("path", m.nsPath).Debug("Namespace path not accessible, attempting PID fallback")
-		pid, err := m.findPID(ctx)
-		if err == nil && pid > 0 {
-			m.nsPath = fmt.Sprintf("/proc/%d/ns/net", pid)
-			log.WithFields(m.logFields(false)).WithField("path", m.nsPath).Info("Falling back to /proc namespace path")
-		} else {
-			log.WithFields(m.logFields(false)).WithError(err).Warn("Failed to find container PID for fallback")
-		}
-	}
-
+	// Resolve the namespace handle.  Try the primary path first; if it is not
+	// accessible (e.g. /var/run/docker/netns is not bind-mounted into the
+	// plugin container), retry the PID-based /proc/<pid>/ns/net path on every
+	// poll tick.  The PID lookup itself may fail transiently while Docker is
+	// still starting the container, so we keep trying until the context deadline.
 	var err error
-	m.nsHandle, err = util.AwaitNetNS(ctx, m.nsPath, pollTime)
+	m.nsHandle, err = m.awaitNetNS(ctx)
 	if err != nil {
 		return err
 	}
@@ -215,7 +206,7 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	hostName, _ := vethPairNames(m.joinReq.EndpointID)
 	hostLink, err := netlink.LinkByName(hostName)
 	if err != nil { return err }
-	
+
 	hostVeth, ok := hostLink.(*netlink.Veth)
 	if !ok { return util.ErrNotVEth }
 	ctrIndex, err := netlink.VethPeerIndex(hostVeth)
@@ -224,9 +215,56 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	m.ctrLink, err = util.AwaitLinkByIndex(ctx, m.netHandle, ctrIndex, pollTime)
 	if err != nil { return err }
 
-	// Wait for Docker to rename it from the temp name to ethX (if we return SrcName/DstPrefix correctly)
-	// But in CreateEndpoint we used vethPairNames.
 	return nil
+}
+
+// awaitNetNS polls for the container's network namespace handle using both
+// the primary SandboxKey path and a PID-based fallback path.  It retries
+// both on every tick so that transient failures (container PID not yet
+// assigned, or bind-mount not available) are eventually resolved.
+func (m *dhcpManager) awaitNetNS(ctx context.Context) (netns.NsHandle, error) {
+	type result struct {
+		ns  netns.NsHandle
+		err error
+	}
+	ch := make(chan result, 1)
+
+	go func() {
+		for {
+			// Try the primary path (SandboxKey).
+			if ns, e := netns.GetFromPath(m.nsPath); e == nil {
+				ch <- result{ns: ns}
+				return
+			}
+
+			// Try the PID-based fallback.
+			findCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			pid, pidErr := m.findPID(findCtx)
+			cancel()
+			if pidErr == nil && pid > 0 {
+				pidPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+				if ns, e := netns.GetFromPath(pidPath); e == nil {
+					m.nsPath = pidPath
+					log.WithFields(m.logFields(false)).WithField("path", pidPath).Info("Using /proc namespace path (bind-mount fallback)")
+					ch <- result{ns: ns}
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				ch <- result{err: ctx.Err()}
+				return
+			case <-time.After(pollTime):
+			}
+		}
+	}()
+
+	res := <-ch
+	if res.err != nil {
+		log.WithFields(m.logFields(false)).WithError(res.err).Error("Failed to resolve container network namespace")
+	}
+	return res.ns, res.err
 }
 
 func (m *dhcpManager) Stop() error {
