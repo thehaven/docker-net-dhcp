@@ -116,8 +116,10 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	go p.cache.ReconcileLoop(context.Background(), client, 10*time.Second)
 	go p.Recover(context.Background())
 	go p.watchDockerEvents(context.Background())
+	go p.scavengerLoop(context.Background())
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", p.apiHealth)
 	mux.HandleFunc("/NetworkDriver.GetCapabilities", p.apiGetCapabilities)
 
 	mux.HandleFunc("/NetworkDriver.CreateNetwork", p.apiCreateNetwork)
@@ -160,8 +162,13 @@ func (p *Plugin) Close() error {
 	return nil
 }
 
+func (p *Plugin) apiHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 func (p *Plugin) watchDockerEvents(ctx context.Context) {
-	log.Info("Starting Docker event listener...")
+	log.Info("Starting Docker event listener for metadata discovery...")
 	
 	msgChan, errChan := p.docker.Events(ctx, events.ListOptions{})
 
@@ -170,15 +177,28 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 		case msg := <-msgChan:
 			if msg.Type == "container" && msg.Action == "create" {
 				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
-				log.WithField("name", name).Debug("Container created, adding to queue")
+				log.WithField("name", name).Debug("Container created, adding to queue and proactive capture")
 				
 				p.Lock()
 				p.creationQueue = append(p.creationQueue, name)
-				// Keep queue small
 				if len(p.creationQueue) > 10 {
 					p.creationQueue = p.creationQueue[1:]
 				}
 				p.Unlock()
+
+				inspectCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+				ctr, err := p.docker.ContainerInspect(inspectCtx, msg.Actor.ID)
+				cancel()
+				if err == nil {
+					// Map ContainerID to Name/Hostname immediately in global map
+					p.cache.SetMetadata("global", msg.Actor.ID, ContainerMetadata{
+						Name:      name,
+						Hostname:  ctr.Config.Hostname,
+						CreatedAt: time.Now(),
+					})
+					// Also start watchdog to link to EndpointID later
+					go p.endpointWatchdog(ctx, msg.Actor.ID, name)
+				}
 			}
 		case err := <-errChan:
 			if err != nil && ctx.Err() == nil {
@@ -188,6 +208,66 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 				return
 			}
 			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *Plugin) endpointWatchdog(ctx context.Context, containerID, name string) {
+	// Poll the container's network settings until an EndpointID appears for our driver
+	limit := time.After(10 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			inspectCtx, cancel := context.WithTimeout(ctx, 1 * time.Second)
+			ctr, err := p.docker.ContainerInspect(inspectCtx, containerID)
+			cancel()
+			if err != nil {
+				if docker.IsErrNotFound(err) { return }
+				continue
+			}
+
+			found := false
+			for netID, netSettings := range ctr.NetworkSettings.Networks {
+				if netSettings.EndpointID != "" {
+					p.cache.SetMetadata(netID, netSettings.EndpointID, ContainerMetadata{
+						Name:      name,
+						Hostname:  ctr.Config.Hostname,
+						CreatedAt: time.Now(),
+					})
+					found = true
+				}
+			}
+			if found { return }
+		case <-limit:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *Plugin) scavengerLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Prune metadata older than 10 minutes
+			p.cache.PruneMetadata(10 * time.Minute)
+			
+			// Also prune creationQueue
+			p.Lock()
+			if len(p.creationQueue) > 0 {
+				// Creation queue is just for very fresh containers, 
+				// we can clear it if it's too old but it's already capped at 10 items.
+			}
+			p.Unlock()
 		case <-ctx.Done():
 			return
 		}

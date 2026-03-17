@@ -69,6 +69,7 @@ upgrade:
 
 create: plugin
 	sudo mkdir -p /var/lib/docker-net-dhcp
+	sudo chmod 0700 /var/lib/docker-net-dhcp
 	docker plugin rm -f $(PLUGIN_NAME):$(PLUGIN_TAG) || true
 	docker plugin create $(PLUGIN_NAME):$(PLUGIN_TAG) $<
 	docker plugin set $(PLUGIN_NAME):$(PLUGIN_TAG) LOG_LEVEL=trace

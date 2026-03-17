@@ -25,8 +25,9 @@ type EndpointState struct {
 
 // ContainerMetadata stores stable seeds for MAC generation
 type ContainerMetadata struct {
-	Name     string `json:"name"`
-	Hostname string `json:"hostname"`
+	Name      string    `json:"name"`
+	Hostname  string    `json:"hostname"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // NetworkState represents the cached configuration of a Docker network and its active endpoints.
@@ -83,12 +84,12 @@ func (c *NetworkCache) save() error {
 	}
 
 	dir := filepath.Dir(c.filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	tmpFile := c.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write temporary cache file: %w", err)
 	}
 
@@ -129,19 +130,60 @@ func (c *NetworkCache) GetMetadata(networkID, endpointID string) (ContainerMetad
 	return meta, found
 }
 
-// SetMetadata adds or updates a container's metadata mapping in the cache.
+// SetMetadata adds or updates a container's metadata mapping in the cache and persists it.
 func (c *NetworkCache) SetMetadata(networkID, endpointID string, meta ContainerMetadata) {
 	c.Lock()
 	defer c.Unlock()
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = time.Now()
+	}
 	net, ok := c.networks[networkID]
 	if !ok {
-		return
+		// Create a placeholder network entry if it doesn't exist (e.g. 'global')
+		net = NetworkState{
+			ID:        networkID,
+			Endpoints: make(map[string]EndpointState),
+		}
 	}
 	if net.MetadataMap == nil {
 		net.MetadataMap = make(map[string]ContainerMetadata)
 	}
 	net.MetadataMap[endpointID] = meta
 	c.networks[networkID] = net
+	_ = c.save()
+}
+
+// PruneMetadata removes metadata entries older than the specified duration.
+func (c *NetworkCache) PruneMetadata(maxAge time.Duration) {
+	c.Lock()
+	defer c.Unlock()
+
+	now := time.Now()
+	changed := false
+
+	for netID, net := range c.networks {
+		if net.MetadataMap == nil {
+			continue
+		}
+		for epID, meta := range net.MetadataMap {
+			if now.Sub(meta.CreatedAt) > maxAge {
+				log.WithFields(log.Fields{
+					"network":  netID,
+					"endpoint": epID,
+					"age":      now.Sub(meta.CreatedAt),
+				}).Debug("Pruning expired metadata")
+				delete(net.MetadataMap, epID)
+				changed = true
+			}
+		}
+		if changed {
+			c.networks[netID] = net
+		}
+	}
+
+	if changed {
+		_ = c.save()
+	}
 }
 
 // GetAll returns all cached networks.
