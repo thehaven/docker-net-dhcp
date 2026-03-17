@@ -33,9 +33,7 @@ type dhcpManager struct {
 	netHandle *netlink.Handle
 	ctrLink   netlink.Link
 
-	stopChan  chan struct{}
-	errChan   chan error
-	errChanV6 chan error
+	stopChan chan struct{}
 }
 
 func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions) *dhcpManager {

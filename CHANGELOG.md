@@ -7,35 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-03-17
 
+Fork of [devplayer0/docker-net-dhcp](https://github.com/devplayer0/docker-net-dhcp) updated and hardened for production use.
+
 ### Added
-- **Deterministic MAC Address Generation**: New `pkg/macgen` library using MD5 hashing of stable seeds (hostname, container name, or fallback hash) to provide predictable MAC addresses for external DHCP reservations. **Enabled by default** for all endpoints without a user-specified MAC address.
-- **IPv6 Stability**: Implemented deterministic `DUID-LL` (Link-Layer) generation based on MAC addresses to ensure stable IPv6 address assignment.
-- **Network State Cache**: Persistent thread-safe JSON cache for network configurations at `/var/lib/docker-net-dhcp/networks.json`.
-- **Endpoint Persistence**: Active endpoints (IPs, SandboxKeys, MACs) are now persisted to the local cache to survive plugin restarts and upgrades.
-- **Warm Recovery Logic**: Automated background recovery that re-adopts existing endpoints and restarts `udhcpc` managers upon plugin startup, enabling zero-interruption upgrades.
-- **Proactive Metadata Discovery**: Background Docker event listener and watchdog to capture container identity immediately upon creation, ensuring 100% reliable deterministic MACs.
-- **Lazy State Reconciliation**: Background worker to automatically prune "ghost" networks from the local cache and auto-populate existing networks from Docker.
-- **Security Hardening**: Enforced strict `0700` directory and `0600` file permissions on the host persistence layer. Implemented atomic state writes to prevent corruption.
-- **Health Diagnostics**: Added a `/health` endpoint for external monitoring and automated re-adoption verification.
-- **CLI Tool**: `docker-net-dhcp-macgen` for offline calculation of deterministic MACs and DUIDs.
-- **Resilient Join Phase**: Added `SandboxKey` path resolution to find network namespaces without calling Docker's `ContainerInspect` API.
-- **Quality Gates**: Added `make test` (Unit/Race detection) and `make verify` (Static analysis) to the `Makefile`.
-- **Modern CI/CD**: Enhanced GitHub Actions with Go 1.24 environment, automated tests, and static analysis before building multi-arch images.
+
+- **Deterministic MAC address generation** (`pkg/macgen`): every container without an explicit `--mac-address` receives a stable MAC derived from its name via `md5(name)[0:5]` prefixed with `02`. The same container name always produces the same MAC, enabling DHCP IP reservations without manual `--mac-address` flags.
+- **`mac_format` network option**: MAC addresses can be formatted as `colon` (default, `02:xx:xx:xx:xx:xx`), `hyphen` (`02-xx-xx-xx-xx-xx`), or `dot` (`02xx.xxxx.xxxx`).
+- **`docker-net-dhcp-macgen` CLI tool**: offline calculation of deterministic MACs for use in DHCP reservation scripts.
+- **IPv6 deterministic DUID-LL**: stable `DUID-LL` generation from the container MAC for consistent IPv6 address assignment.
+- **Persistent network cache** (`/var/lib/docker-net-dhcp/networks.json`): active network and endpoint state survives plugin restarts. On re-enable the plugin re-adopts existing containers and resumes DHCP renewals without requiring a container restart.
+- **Docker event listener**: the plugin listens for container creation events and queues container names before `CreateEndpoint` is called, ensuring 100% reliable deterministic MACs even under load.
+- **DNS hostname registration**: the container name is sent as the DHCP hostname (Options 12 and 81), so containers appear in DNS automatically when the DHCP server is configured to update DNS from leases. Pass `--hostname` to use a different name.
+- **Per-network FIFO pending queue**: container-name entries are stored per-network and consumed in FIFO order, preventing any stale entry from being assigned to the wrong container.
+- **`/health` HTTP endpoint**: returns plugin status for external monitoring.
+- **`make test`** (unit tests with race detection) and **`make verify`** (go vet) build targets.
+- **Multi-arch CI/CD**: GitHub Actions builds `amd64` and `arm64` images and publishes them to GHCR on every tagged release.
 
 ### Changed
-- **Architecture**: Decoupled critical plugin paths (`CreateEndpoint`, `Join`) from the Docker Engine API to eliminate startup deadlocks.
-- **Namespace Handling**: Refactored `udhcpc` execution to use `nsenter` for reliable namespace isolation, bypassing Go's thread-scheduling limitations.
-- **Thread Safety**: Protected all internal shared state with `sync.RWMutex` to prevent crashes during high-churn re-adoption events.
-- **Docker Client**: Updated to use lazy initialization and automatic API version negotiation.
-- **Observability**: Implemented structured logging with request correlation IDs and explicit MAC derivation logging.
-- **Configuration**: Updated `config.json` to include mandatory persistent volume mount for the network cache.
-- **Fork Update**: Migrated project identity and module path to `github.com/thehaven/docker-net-dhcp`.
+
+- **Module path** migrated to `github.com/thehaven/docker-net-dhcp`.
+- **Docker SDK** updated to v28 (latest stable); Go toolchain updated to 1.24.
+- **Default lease timeout** increased from 10 s to 30 s for reliability on slower DHCP servers.
+- **Container interface naming**: containers now consistently receive `eth0` (and `eth1`, etc. for multi-network) inside the namespace.
+- **Cache reconciliation interval** set to 5 minutes (avoids log noise from the previous 10-second polling interval).
+- **`udhcpc` execution** moved into the container network namespace via direct namespace handle, removing the dependency on `nsenter` and `util-linux`.
+- **Thread safety**: all shared plugin state protected with `sync.RWMutex`.
 
 ### Fixed
-- Resolved long-standing startup hangs caused by circular dependencies between the plugin and Docker daemon during container auto-restart policies.
-- Fixed Docker API version mismatch errors on modern Docker Engine installations.
-- Corrected error handling in `udhcpc-handler` to prevent log-wrapping failures.
+
+- Static-MAC containers (`--mac-address`) now correctly consume their pending queue entry, preventing their container name from being used as the MAC seed for the *next* dynamic-MAC container on the same network.
+- Default Docker hostname (short container ID) no longer propagated to DHCP; the container name is used instead, so DNS registers as `<name>.<domain>` rather than `<id>.<domain>`.
+- `IsDHCPPlugin` now matches both `ghcr.io/thehaven/docker-net-dhcp` and `ghcr.io/devplayer0/docker-net-dhcp` driver strings, preventing existing networks from being ghost-pruned from the cache on plugin restart.
+- Resolved long-standing startup deadlocks caused by circular dependencies between the plugin and the Docker daemon during container auto-restart.
+- Corrected Docker API version negotiation errors on modern Docker Engine installations.
 
 ### Removed
+
+- Removed the `mac_seed_source` network option (was documented but never functional).
 - Removed synchronous blocking calls to `NetworkInspect` from the `CreateEndpoint` hot path.
-- Removed reliance on `runtime.LockOSThread` for namespace transitions in favour of `nsenter`.
+- Removed dead `endpointWatchdog` goroutine.
+- Removed dead Join-time MAC override code path.

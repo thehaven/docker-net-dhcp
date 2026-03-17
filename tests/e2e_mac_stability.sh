@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# Use the forked driver name
 DRIVER="ghcr.io/thehaven/docker-net-dhcp:golang"
 NETWORK="test-vlan-999"
 BRIDGE="vlan107" # Use the existing bridge that we know works
@@ -23,12 +22,12 @@ echo "Attempt 2 MAC (Deterministic): $MAC2"
 
 if [ "$MAC1" != "$MAC2" ]; then
     echo "FAILURE: Deterministic MAC changed!"
-    # sudo docker network rm $NETWORK
+    sudo docker network rm $NETWORK
     exit 1
 fi
 echo "SUCCESS: Deterministic MAC is stable."
 
-echo "--- Phase 3: Testing User Override Precedence (THE BUG FIX) ---"
+echo "--- Phase 3: Testing User MAC Override ---"
 NAME="test-manual-mac"
 SPECIFIED_MAC="02:de:ad:be:ef:01"
 sudo docker rm -f $NAME >/dev/null 2>&1 || true
@@ -38,7 +37,7 @@ echo "Actual MAC:    $ACTUAL_MAC"
 
 if [ "$SPECIFIED_MAC" != "$ACTUAL_MAC" ]; then
     echo "FAILURE: User-specified MAC was ignored or modified!"
-    # sudo docker network rm $NETWORK
+    sudo docker network rm $NETWORK
     exit 1
 fi
 echo "SUCCESS: User-specified MAC accepted without error."

@@ -46,7 +46,6 @@ type DHCPNetworkOptions struct {
 	LeaseTimeout    time.Duration `mapstructure:"lease_timeout"`
 	IgnoreConflicts bool          `mapstructure:"ignore_conflicts"`
 	SkipRoutes      bool          `mapstructure:"skip_routes"`
-	MacSeedSource   string        `mapstructure:"mac_seed_source"`
 	MacFormat       string        `mapstructure:"mac_format"`
 }
 
