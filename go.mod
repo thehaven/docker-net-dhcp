@@ -1,4 +1,4 @@
-module github.com/devplayer0/docker-net-dhcp
+module github.com/thehaven/docker-net-dhcp
 
 go 1.24.0
 

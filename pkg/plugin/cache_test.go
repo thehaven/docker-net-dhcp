@@ -83,7 +83,7 @@ func TestNetworkCache(t *testing.T) {
 
 	mockDocker := &mockDockerClient{
 		networks: []network.Inspect{
-			{ID: "real-net", Driver: "ghcr.io/devplayer0/docker-net-dhcp:latest"},
+			{ID: "real-net", Driver: "ghcr.io/thehaven/docker-net-dhcp:latest"},
 		},
 		delay: 0,
 	}

@@ -18,7 +18,7 @@ make bin/net-dhcp bin/udhcpc-handler
 ### 2. Build the RootFS Image
 Build the Docker image that contains the plugin environment (Alpine-based).
 ```bash
-sudo docker build -t ghcr.io/devplayer0/docker-net-dhcp:rootfs .
+sudo docker build -t ghcr.io/thehaven/docker-net-dhcp:rootfs .
 ```
 
 ### 3. Extract the RootFS
@@ -28,7 +28,7 @@ The Docker plugin system requires a flattened directory of the filesystem.
 rm -rf plugin/rootfs && mkdir -p plugin/rootfs
 
 # Create a temporary container to export the filesystem
-sudo docker create --name tmp ghcr.io/devplayer0/docker-net-dhcp:rootfs
+sudo docker create --name tmp ghcr.io/thehaven/docker-net-dhcp:rootfs
 sudo docker export tmp | tar xC plugin/rootfs
 sudo docker rm -vf tmp
 
@@ -43,16 +43,16 @@ Since Docker networks are tied to the plugin name/tag, we replace the plugin in-
 
 ```bash
 # 1. Force disable the plugin
-sudo docker plugin disable -f ghcr.io/devplayer0/docker-net-dhcp:golang
+sudo docker plugin disable -f ghcr.io/thehaven/docker-net-dhcp:golang
 
 # 2. Remove the old version
-sudo docker plugin rm -f ghcr.io/devplayer0/docker-net-dhcp:golang
+sudo docker plugin rm -f ghcr.io/thehaven/docker-net-dhcp:golang
 
 # 3. Create the plugin from the local 'plugin' directory
-sudo docker plugin create ghcr.io/devplayer0/docker-net-dhcp:golang plugin
+sudo docker plugin create ghcr.io/thehaven/docker-net-dhcp:golang plugin
 
 # 4. Re-enable the plugin
-sudo docker plugin enable ghcr.io/devplayer0/docker-net-dhcp:golang
+sudo docker plugin enable ghcr.io/thehaven/docker-net-dhcp:golang
 ```
 
 ### 5. Verification

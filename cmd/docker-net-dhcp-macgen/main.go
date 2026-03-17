@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/devplayer0/docker-net-dhcp/pkg/macgen"
+	"github.com/thehaven/docker-net-dhcp/pkg/macgen"
 )
 
 func main() {

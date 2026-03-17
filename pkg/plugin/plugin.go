@@ -17,7 +17,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
-	"github.com/devplayer0/docker-net-dhcp/pkg/util"
+	"github.com/thehaven/docker-net-dhcp/pkg/util"
 )
 
 // DriverName is the name of the Docker Network Driver
@@ -25,7 +25,7 @@ const DriverName string = "net-dhcp"
 
 const defaultLeaseTimeout = 30 * time.Second
 
-var driverRegexp = regexp.MustCompile(`^ghcr\.io/devplayer0/docker-net-dhcp:.+$`)
+var driverRegexp = regexp.MustCompile(`^ghcr\.io/thehaven/docker-net-dhcp:.+$`)
 
 // IsDHCPPlugin checks if a Docker network driver is an instance of this plugin
 func IsDHCPPlugin(driver string) bool {
