@@ -21,6 +21,7 @@ type EndpointState struct {
 	IP         string `json:"ip"`
 	IPv6       string `json:"ipv6,omitempty"`
 	Gateway    string `json:"gateway"`
+	Hostname   string `json:"hostname,omitempty"` // persisted for DHCP registration on recovery
 }
 
 // ContainerMetadata stores stable seeds for MAC generation

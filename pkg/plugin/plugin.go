@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/network"
 	docker "github.com/docker/docker/client"
 	"github.com/gorilla/handlers"
 	"github.com/mitchellh/mapstructure"
@@ -25,11 +26,17 @@ const DriverName string = "net-dhcp"
 
 const defaultLeaseTimeout = 30 * time.Second
 
-var driverRegexp = regexp.MustCompile(`^ghcr\.io/thehaven/docker-net-dhcp:.+$`)
+// Both the canonical (thehaven) and legacy (devplayer0) plugin names are accepted
+// so that cache reconciliation does not ghost-prune networks created under the
+// old name (e.g. vlan107 using ghcr.io/devplayer0/docker-net-dhcp:golang).
+var (
+	driverRegexpNew = regexp.MustCompile(`^ghcr\.io/thehaven/docker-net-dhcp:.+$`)
+	driverRegexpOld = regexp.MustCompile(`^ghcr\.io/devplayer0/docker-net-dhcp:.+$`)
+)
 
-// IsDHCPPlugin checks if a Docker network driver is an instance of this plugin
+// IsDHCPPlugin checks if a Docker network driver is an instance of this plugin.
 func IsDHCPPlugin(driver string) bool {
-	return driverRegexp.MatchString(driver)
+	return driverRegexpNew.MatchString(driver) || driverRegexpOld.MatchString(driver)
 }
 
 // DHCPNetworkOptions contains options for the DHCP network driver
@@ -56,18 +63,27 @@ func decodeOpts(input interface{}) (DHCPNetworkOptions, error) {
 	if err != nil {
 		return opts, fmt.Errorf("failed to create options decoder: %w", err)
 	}
-
 	if err := optsDecoder.Decode(input); err != nil {
 		return opts, err
 	}
-
 	return opts, nil
 }
 
 type joinHint struct {
-	IPv4    *netlink.Addr
-	IPv6    *netlink.Addr
-	Gateway string
+	IPv4     *netlink.Addr
+	IPv6     *netlink.Addr
+	Gateway  string
+	Hostname string // container hostname, propagated to DHCP Option 12 / Option 81
+}
+
+// pendingContainer holds transient info about a container that has been
+// created but not yet assigned an endpoint. Used to correlate container
+// names with CreateEndpoint calls for deterministic MAC seeding and
+// DHCP hostname registration.
+type pendingContainer struct {
+	name      string
+	hostname  string
+	createdAt time.Time
 }
 
 // Plugin is the DHCP network plugin
@@ -82,9 +98,12 @@ type Plugin struct {
 	persistentDHCP map[string]*dhcpManager
 
 	cache *NetworkCache
-	
-	// Ordered Queue of recently created container names for deterministic matching
-	creationQueue []string
+
+	// Per-network FIFO queue of recently created containers awaiting endpoint
+	// assignment. Keyed by Docker network UUID. Populated by watchDockerEvents,
+	// consumed (popped) by CreateEndpoint. This eliminates the previous global
+	// LIFO creationQueue that caused incorrect MAC seed assignment.
+	pendingByNetwork map[string][]pendingContainer
 }
 
 // NewPlugin creates a new Plugin
@@ -97,23 +116,18 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	}
 
 	p := &Plugin{
-		awaitTimeout: awaitTimeout,
-
-		docker: client,
-
-		joinHints:      make(map[string]joinHint),
-		persistentDHCP: make(map[string]*dhcpManager),
-
-		cache: NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
-		
-		creationQueue: make([]string, 0),
+		awaitTimeout:     awaitTimeout,
+		docker:           client,
+		joinHints:        make(map[string]joinHint),
+		persistentDHCP:   make(map[string]*dhcpManager),
+		cache:            NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
+		pendingByNetwork: make(map[string][]pendingContainer),
 	}
 
-	// First reconciliation (immediate) to populate cache for recovery
+	// Immediate reconciliation to populate cache before recovery runs.
 	p.cache.Reconcile(context.Background(), client, 0)
 
-	// Background tasks
-	go p.cache.ReconcileLoop(context.Background(), client, 10*time.Second)
+	go p.cache.ReconcileLoop(context.Background(), client, 5*time.Minute)
 	go p.Recover(context.Background())
 	go p.watchDockerEvents(context.Background())
 	go p.scavengerLoop(context.Background())
@@ -145,7 +159,6 @@ func (p *Plugin) Listen(bindSock string) error {
 	if err != nil {
 		return err
 	}
-
 	return p.server.Serve(l)
 }
 
@@ -154,11 +167,9 @@ func (p *Plugin) Close() error {
 	if err := p.docker.Close(); err != nil {
 		return fmt.Errorf("failed to close docker client: %w", err)
 	}
-
 	if err := p.server.Close(); err != nil {
 		return fmt.Errorf("failed to close http server: %w", err)
 	}
-
 	return nil
 }
 
@@ -167,9 +178,65 @@ func (p *Plugin) apiHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+// ---------------------------------------------------------------------------
+// Pending container queue — per-network FIFO
+// ---------------------------------------------------------------------------
+
+// pushPendingContainer enqueues a container into the FIFO pending list for
+// the given Docker network UUID.
+func (p *Plugin) pushPendingContainer(networkID, name, hostname string) {
+	p.Lock()
+	defer p.Unlock()
+	p.pendingByNetwork[networkID] = append(p.pendingByNetwork[networkID], pendingContainer{
+		name:      name,
+		hostname:  hostname,
+		createdAt: time.Now(),
+	})
+}
+
+// popPendingContainer removes and returns the oldest pending container for
+// the given network UUID. Returns ("", "") when the queue is empty.
+func (p *Plugin) popPendingContainer(networkID string) (name, hostname string) {
+	p.Lock()
+	defer p.Unlock()
+	queue := p.pendingByNetwork[networkID]
+	if len(queue) == 0 {
+		return "", ""
+	}
+	pc := queue[0]
+	p.pendingByNetwork[networkID] = queue[1:]
+	return pc.name, pc.hostname
+}
+
+// pruneExpiredPending removes pending container entries older than maxAge.
+func (p *Plugin) pruneExpiredPending(maxAge time.Duration) {
+	p.Lock()
+	defer p.Unlock()
+	cutoff := time.Now().Add(-maxAge)
+	for netID, queue := range p.pendingByNetwork {
+		fresh := queue[:0]
+		for _, pc := range queue {
+			if pc.createdAt.After(cutoff) {
+				fresh = append(fresh, pc)
+			}
+		}
+		if len(fresh) == 0 {
+			delete(p.pendingByNetwork, netID)
+		} else {
+			p.pendingByNetwork[netID] = fresh
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Docker event listener
+// ---------------------------------------------------------------------------
+
+// watchDockerEvents listens for container create events and pre-populates the
+// per-network pending queue so that CreateEndpoint can resolve the container
+// name for deterministic MAC generation.
 func (p *Plugin) watchDockerEvents(ctx context.Context) {
-	log.Info("Starting Docker event listener for metadata discovery...")
-	
+	log.Info("Starting Docker event listener for container name pre-caching...")
 	msgChan, errChan := p.docker.Events(ctx, events.ListOptions{})
 
 	for {
@@ -177,27 +244,35 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 		case msg := <-msgChan:
 			if msg.Type == "container" && msg.Action == "create" {
 				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
-				log.WithField("name", name).Debug("Container created, adding to queue and proactive capture")
-				
-				p.Lock()
-				p.creationQueue = append(p.creationQueue, name)
-				if len(p.creationQueue) > 10 {
-					p.creationQueue = p.creationQueue[1:]
-				}
-				p.Unlock()
 
-				inspectCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				ctr, err := p.docker.ContainerInspect(inspectCtx, msg.Actor.ID)
 				cancel()
-				if err == nil {
-					// Map ContainerID to Name/Hostname immediately in global map
-					p.cache.SetMetadata("global", msg.Actor.ID, ContainerMetadata{
-						Name:      name,
-						Hostname:  ctr.Config.Hostname,
-						CreatedAt: time.Now(),
-					})
-					// Also start watchdog to link to EndpointID later
-					go p.endpointWatchdog(ctx, msg.Actor.ID, name)
+				if err != nil {
+					log.WithError(err).WithField("name", name).Debug("Could not inspect created container for seed caching")
+					continue
+				}
+
+				hostname := ctr.Config.Hostname
+				// Docker defaults the internal hostname to the short container ID
+				// (first 12 hex chars) when the user does not set --hostname.
+				// Using that as the DHCP hostname would register the container ID in
+				// DNS instead of the container name.  Fall back to the container name
+				// so `docker run --name foo …` produces DNS entry foo.<domain>.
+				if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
+					hostname = name
+				}
+
+				// Docker only allows a single --network at container creation time.
+				// Additional networks are connected via `docker network connect`
+				// which fires a separate "network connect" event (not handled here
+				// since CreateEndpoint for multi-network requires a separate pending
+				// entry — out of scope for now). The primary network is in
+				// HostConfig.NetworkMode.
+				netName := string(ctr.HostConfig.NetworkMode)
+				if netName != "" && netName != "default" && netName != "bridge" &&
+					netName != "host" && netName != "none" {
+					p.registerPendingForNetwork(ctx, netName, name, hostname)
 				}
 			}
 		case err := <-errChan:
@@ -214,60 +289,41 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 	}
 }
 
-func (p *Plugin) endpointWatchdog(ctx context.Context, containerID, name string) {
-	// Poll the container's network settings until an EndpointID appears for our driver
-	limit := time.After(10 * time.Second)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			inspectCtx, cancel := context.WithTimeout(ctx, 1 * time.Second)
-			ctr, err := p.docker.ContainerInspect(inspectCtx, containerID)
-			cancel()
-			if err != nil {
-				if docker.IsErrNotFound(err) { return }
-				continue
-			}
-
-			found := false
-			for netID, netSettings := range ctr.NetworkSettings.Networks {
-				if netSettings.EndpointID != "" {
-					p.cache.SetMetadata(netID, netSettings.EndpointID, ContainerMetadata{
-						Name:      name,
-						Hostname:  ctr.Config.Hostname,
-						CreatedAt: time.Now(),
-					})
-					found = true
-				}
-			}
-			if found { return }
-		case <-limit:
-			return
-		case <-ctx.Done():
-			return
-		}
+// registerPendingForNetwork resolves a network name-or-ID to its UUID, verifies
+// it is a DHCP plugin network, and pushes the container into the pending queue.
+// Returns true on success.
+func (p *Plugin) registerPendingForNetwork(ctx context.Context, netNameOrID, containerName, hostname string) bool {
+	netCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	n, err := p.docker.NetworkInspect(netCtx, netNameOrID, network.InspectOptions{})
+	cancel()
+	if err != nil {
+		log.WithError(err).WithField("network", netNameOrID).Debug("Could not resolve network for pending container")
+		return false
 	}
+	if !IsDHCPPlugin(n.Driver) {
+		return false
+	}
+	p.pushPendingContainer(n.ID, containerName, hostname)
+	log.WithFields(log.Fields{
+		"container": containerName,
+		"hostname":  hostname,
+		"network":   netNameOrID,
+		"networkID": n.ID[:12],
+	}).Debug("Queued pending container for MAC seed lookup")
+	return true
 }
 
+// scavengerLoop periodically removes stale entries from the pending queue.
+// Entries older than 2 minutes are guaranteed to be uncollected (CreateEndpoint
+// runs within milliseconds of container create), so pruning them is safe.
 func (p *Plugin) scavengerLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Prune metadata older than 10 minutes
-			p.cache.PruneMetadata(10 * time.Minute)
-			
-			// Also prune creationQueue
-			p.Lock()
-			if len(p.creationQueue) > 0 {
-				// Creation queue is just for very fresh containers, 
-				// we can clear it if it's too old but it's already capped at 10 items.
-			}
-			p.Unlock()
+			p.pruneExpiredPending(2 * time.Minute)
 		case <-ctx.Done():
 			return
 		}

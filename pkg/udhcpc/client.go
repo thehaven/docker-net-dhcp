@@ -64,16 +64,8 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	}
 
 	if opts.Once {
-		// Initial lease acquisition: fast retries, limited attempts
-		// -t 5: retry 5 times before giving up
-		// -T 3: wait 3 seconds between retries
-		// -A 5: wait 5 seconds before retrying after failure
 		c.cmd.Args = append(c.cmd.Args, "-t", "5", "-T", "3", "-A", "5")
 	} else {
-		// Persistent client: relaxed settings to avoid DHCP server flooding
-		// No -t: retry forever (container needs to maintain lease)
-		// -T 5: wait 5 seconds between retries
-		// -A 30: wait 30 seconds after failure before retrying (prevents thundering herd)
 		c.cmd.Args = append(c.cmd.Args, "-T", "5", "-A", "30")
 	}
 
@@ -81,7 +73,6 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up udhcpc stderr pipe: %w", err)
 	}
-	// Pipe udhcpc stderr (logs) to logrus at debug level
 	go io.Copy(log.StandardLogger().WriterLevel(log.DebugLevel), stderrPipe)
 
 	if c.eventPipe, err = c.cmd.StdoutPipe(); err != nil {
@@ -89,31 +80,27 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 	}
 
 	if opts.Once {
-		// Exit after obtaining lease
 		c.cmd.Args = append(c.cmd.Args, "-q")
 	} else {
-		// Release IP address on exit
 		c.cmd.Args = append(c.cmd.Args, "-R")
 	}
 
 	if opts.Hostname != "" {
+		// DUAL SIGNALING: Use both Option 12 (hostname) and Option 81 (FQDN) for maximum compatibility
 		hostnameOpt := "hostname:" + opts.Hostname
 		if opts.V6 {
-			// TODO: We encode the fqdn for DHCPv6 because udhcpc6 seems to be broken
 			var data bytes.Buffer
-
-			// flags: S bit set (see RFC4704)
 			binary.Write(&data, binary.BigEndian, uint8(0b0001))
 			binary.Write(&data, binary.BigEndian, uint8(len(opts.Hostname)))
 			data.WriteString(opts.Hostname)
-
 			hostnameOpt = "0x27:" + hex.EncodeToString(data.Bytes())
+		} else {
+			// v4 Client FQDN (Option 81)
+			c.cmd.Args = append(c.cmd.Args, "-F", opts.Hostname)
 		}
-
 		c.cmd.Args = append(c.cmd.Args, "-x", hostnameOpt)
 	}
 
-	// Vendor ID string option is not available for udhcpc6
 	if !opts.V6 {
 		c.cmd.Args = append(c.cmd.Args, "-V", VendorID)
 	}
@@ -135,7 +122,6 @@ func (c *DHCPClient) Start() (chan Event, error) {
 		for scanner.Scan() {
 			log.WithField("line", string(scanner.Bytes())).Trace("udhcpc handler line")
 
-			// Each line is a JSON-encoded event
 			var event Event
 			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 				log.WithError(err).Warn("Failed to decode udhcpc event")
@@ -149,10 +135,8 @@ func (c *DHCPClient) Start() (chan Event, error) {
 	return events, nil
 }
 
-// Finish sends SIGTERM to udhcpc(6) and waits for it to exit. SIGTERM will not
-// be sent if `Opts.Once` is set.
+// Finish sends SIGTERM to udhcpc(6) and waits for it to exit.
 func (c *DHCPClient) Finish(ctx context.Context) error {
-	// If only running to get an IP once, udhcpc will terminate on its own
 	if !c.Opts.Once {
 		if err := c.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			return fmt.Errorf("failed to send SIGTERM to udhcpc: %w", err)
@@ -168,13 +152,14 @@ func (c *DHCPClient) Finish(ctx context.Context) error {
 	case err := <-errChan:
 		return err
 	case <-ctx.Done():
-		c.cmd.Process.Kill()
+		if c.cmd.Process != nil {
+			c.cmd.Process.Kill()
+		}
 		return ctx.Err()
 	}
 }
 
-// GetIP is a convenience function that runs udhcpc(6) once and returns the IP
-// info obtained.
+// GetIP is a convenience function that runs udhcpc(6) once and returns the IP info.
 func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, error) {
 	dummy := Info{}
 

@@ -6,78 +6,14 @@ import (
 	"github.com/thehaven/docker-net-dhcp/pkg/util"
 )
 
-// Payloads are based on https://github.com/docker/go-plugins-helpers/blob/master/network/api.go
-
-// CapabilitiesResponse returns whether or not this network is global or local
-type CapabilitiesResponse struct {
-	Scope             string
-	ConnectivityScope string
-}
-
-func (p *Plugin) apiGetCapabilities(w http.ResponseWriter, r *http.Request) {
-	util.JSONResponse(w, CapabilitiesResponse{
-		Scope:             "local",
-		ConnectivityScope: "global",
-	}, http.StatusOK)
-}
-
-// IPAMData contains IPv4 or IPv6 addressing information
-type IPAMData struct {
-	AddressSpace string
-	Pool         string
-	Gateway      string
-	AuxAddresses map[string]interface{}
-}
-
-// CreateNetworkRequest is sent by the daemon when a network needs to be created
-type CreateNetworkRequest struct {
-	NetworkID string
-	Options   map[string]interface{}
-	IPv4Data  []*IPAMData
-	IPv6Data  []*IPAMData
-}
-
-func (p *Plugin) apiCreateNetwork(w http.ResponseWriter, r *http.Request) {
-	var req CreateNetworkRequest
-	if err := util.ParseJSONBody(&req, w, r); err != nil {
-		return
-	}
-
-	if err := p.CreateNetwork(req); err != nil {
-		util.JSONErrResponse(w, err, 0)
-		return
-	}
-
-	util.JSONResponse(w, struct{}{}, http.StatusOK)
-}
-
-// DeleteNetworkRequest is sent by the daemon when a network needs to be removed
-type DeleteNetworkRequest struct {
-	NetworkID string
-}
-
-func (p *Plugin) apiDeleteNetwork(w http.ResponseWriter, r *http.Request) {
-	var req DeleteNetworkRequest
-	if err := util.ParseJSONBody(&req, w, r); err != nil {
-		return
-	}
-
-	if err := p.DeleteNetwork(req); err != nil {
-		util.JSONErrResponse(w, err, 0)
-		return
-	}
-
-	util.JSONResponse(w, struct{}{}, http.StatusOK)
-}
-
-// EndpointInterface contains endpoint interface information
+// EndpointInterface represents a network interface
 type EndpointInterface struct {
-	Address     string
-	AddressIPv6 string
-	MacAddress  string
+	Address     string `json:",omitempty"`
+	AddressIPv6 string `json:",omitempty"`
+	MacAddress  string `json:",omitempty"`
 }
 
-// CreateEndpointRequest is sent by the daemon when an endpoint should be created
+// CreateEndpointRequest is the request to create an endpoint
 type CreateEndpointRequest struct {
 	NetworkID  string
 	EndpointID string
@@ -85,9 +21,88 @@ type CreateEndpointRequest struct {
 	Options    map[string]interface{}
 }
 
-// CreateEndpointResponse is sent as a response to a CreateEndpointRequest
+// CreateEndpointResponse is the response to creating an endpoint
 type CreateEndpointResponse struct {
-	Interface *EndpointInterface
+	Interface *EndpointInterface `json:",omitempty"`
+}
+
+// InfoRequest is the request for information about an endpoint
+type InfoRequest struct {
+	NetworkID  string
+	EndpointID string
+}
+
+// InfoResponse is the response to an info request
+type InfoResponse struct {
+	Value map[string]interface{}
+}
+
+// DeleteEndpointRequest is the request to delete an endpoint
+type DeleteEndpointRequest struct {
+	NetworkID  string
+	EndpointID string
+}
+
+// InterfaceName represents the name of an interface
+type InterfaceName struct {
+	SrcName   string
+	DstPrefix string
+}
+
+// StaticRoute represents a static route
+type StaticRoute struct {
+	Destination string
+	NextHop     string
+	RouteType   int
+}
+
+// JoinRequest is the request to join a container to an endpoint
+type JoinRequest struct {
+	NetworkID  string
+	EndpointID string
+	SandboxKey string
+	Options    map[string]interface{}
+}
+
+// JoinResponse is the response to a join request
+type JoinResponse struct {
+	InterfaceName InterfaceName `json:",omitempty"`
+	Gateway       string        `json:",omitempty"`
+	GatewayIPv6   string        `json:",omitempty"`
+	StaticRoutes  []*StaticRoute `json:",omitempty"`
+}
+
+// LeaveRequest is the request to remove a container from an endpoint
+type LeaveRequest struct {
+	NetworkID  string
+	EndpointID string
+}
+
+// IPv4Data contains IPv4-related network information
+type IPv4Data struct {
+	AddressSpace string
+	Pool         string
+	Gateway      string
+	AuxAddresses map[string]string
+}
+
+// CreateNetworkRequest is the request to create a network
+type CreateNetworkRequest struct {
+	NetworkID string
+	Options   map[string]interface{}
+	IPv4Data  []IPv4Data
+	IPv6Data  []IPv4Data
+}
+
+// DeleteNetworkRequest is the request to delete a network
+type DeleteNetworkRequest struct {
+	NetworkID string
+}
+
+func (p *Plugin) apiGetCapabilities(w http.ResponseWriter, r *http.Request) {
+	util.JSONResponse(w, map[string]string{
+		"Scope": "local",
+	}, http.StatusOK)
 }
 
 func (p *Plugin) apiCreateEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -105,17 +120,6 @@ func (p *Plugin) apiCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	util.JSONResponse(w, res, http.StatusOK)
 }
 
-// InfoRequest is sent by the daemon when querying endpoint information
-type InfoRequest struct {
-	NetworkID  string
-	EndpointID string
-}
-
-// InfoResponse is endpoint information sent in response to an InfoRequest
-type InfoResponse struct {
-	Value map[string]string
-}
-
 func (p *Plugin) apiEndpointOperInfo(w http.ResponseWriter, r *http.Request) {
 	var req InfoRequest
 	if err := util.ParseJSONBody(&req, w, r); err != nil {
@@ -131,12 +135,6 @@ func (p *Plugin) apiEndpointOperInfo(w http.ResponseWriter, r *http.Request) {
 	util.JSONResponse(w, res, http.StatusOK)
 }
 
-// DeleteEndpointRequest is sent by the daemon when an endpoint needs to be removed
-type DeleteEndpointRequest struct {
-	NetworkID  string
-	EndpointID string
-}
-
 func (p *Plugin) apiDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req DeleteEndpointRequest
 	if err := util.ParseJSONBody(&req, w, r); err != nil {
@@ -148,38 +146,7 @@ func (p *Plugin) apiDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	util.JSONResponse(w, struct{}{}, http.StatusOK)
-}
-
-// JoinRequest is sent by the Daemon when an endpoint needs be joined to a network
-type JoinRequest struct {
-	NetworkID  string
-	EndpointID string
-	SandboxKey string
-	Options    map[string]interface{}
-}
-
-// InterfaceName consists of the name of the interface in the global netns and
-// the desired prefix to be appended to the interface inside the container netns
-type InterfaceName struct {
-	SrcName   string
-	DstPrefix string
-}
-
-// StaticRoute contains static route information
-type StaticRoute struct {
-	Destination string
-	RouteType   int
-	NextHop     string
-}
-
-// JoinResponse is sent in response to a JoinRequest
-type JoinResponse struct {
-	InterfaceName         InterfaceName
-	Gateway               string
-	GatewayIPv6           string
-	StaticRoutes          []*StaticRoute
-	DisableGatewayService bool
+	util.JSONResponse(w, map[string]string{}, http.StatusOK)
 }
 
 func (p *Plugin) apiJoin(w http.ResponseWriter, r *http.Request) {
@@ -197,12 +164,6 @@ func (p *Plugin) apiJoin(w http.ResponseWriter, r *http.Request) {
 	util.JSONResponse(w, res, http.StatusOK)
 }
 
-// LeaveRequest is sent by the daemon when a endpoint is leaving a network
-type LeaveRequest struct {
-	NetworkID  string
-	EndpointID string
-}
-
 func (p *Plugin) apiLeave(w http.ResponseWriter, r *http.Request) {
 	var req LeaveRequest
 	if err := util.ParseJSONBody(&req, w, r); err != nil {
@@ -214,5 +175,33 @@ func (p *Plugin) apiLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	util.JSONResponse(w, struct{}{}, http.StatusOK)
+	util.JSONResponse(w, map[string]string{}, http.StatusOK)
+}
+
+func (p *Plugin) apiCreateNetwork(w http.ResponseWriter, r *http.Request) {
+	var req CreateNetworkRequest
+	if err := util.ParseJSONBody(&req, w, r); err != nil {
+		return
+	}
+
+	if err := p.CreateNetwork(req); err != nil {
+		util.JSONErrResponse(w, err, 0)
+		return
+	}
+
+	util.JSONResponse(w, map[string]string{}, http.StatusOK)
+}
+
+func (p *Plugin) apiDeleteNetwork(w http.ResponseWriter, r *http.Request) {
+	var req DeleteNetworkRequest
+	if err := util.ParseJSONBody(&req, w, r); err != nil {
+		return
+	}
+
+	if err := p.DeleteNetwork(req); err != nil {
+		util.JSONErrResponse(w, err, 0)
+		return
+	}
+
+	util.JSONResponse(w, map[string]string{}, http.StatusOK)
 }

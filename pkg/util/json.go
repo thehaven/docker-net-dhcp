@@ -13,6 +13,10 @@ func JSONResponse(w http.ResponseWriter, v interface{}, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
+	// Diagnostic logging of the actual payload
+	data, _ := json.Marshal(v)
+	log.WithField("payload", string(data)).Debug("Sending JSON response")
+
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.WithField("err", err).Error("Failed to serialize JSON payload")
 
@@ -41,18 +45,9 @@ func JSONErrResponse(w http.ResponseWriter, err error, statusCode int) {
 
 // ParseJSONBody attempts to parse the request body as JSON
 func ParseJSONBody(v interface{}, w http.ResponseWriter, r *http.Request) error {
-	//data, err := io.ReadAll(r.Body)
-	//if err != nil {
-	//	JSONErrResponse(w, fmt.Errorf("failed to read request body: %w", err), 0)
-	//	return err
-	//}
-
-	//log.WithField("body", string(data)).Debug("request body")
-
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 	if err := d.Decode(v); err != nil {
-		//if err := json.Unmarshal(data, v); err != nil {
 		JSONErrResponse(w, fmt.Errorf("failed to parse request body: %w", err), http.StatusBadRequest)
 		return err
 	}
