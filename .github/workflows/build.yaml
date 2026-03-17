@@ -7,17 +7,18 @@ on:
 
 jobs:
   docker:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     env:
       PLUGIN_NAME: ghcr.io/thehaven/docker-net-dhcp
-      PLATFORMS: linux/amd64,linux/386,linux/arm64,linux/arm/v7
+      # Use platforms supported by the project
+      PLATFORMS: linux/amd64,linux/arm64/v8
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.24'
 
@@ -40,15 +41,13 @@ jobs:
         name: Generate build vars
         run: |
           SHA="${{ github.sha }}"
-          echo "::set-output name=tag::"${SHA:0:8}-$(date +%s)Z""
+          echo "tag=${SHA:0:8}" >> $GITHUB_OUTPUT
 
-      - name: Build
-        run: make PLUGIN_TAG=${{ steps.vars.outputs.tag }} multiarch
-
-      - name: Push
+      - name: Build and Push
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           make PLUGIN_TAG=${{ steps.vars.outputs.tag }} push-multiarch
+          # Also tag as latest
           scripts/tag_multiarch_plugin.py -p "$PLATFORMS" "$PLUGIN_NAME:${{ steps.vars.outputs.tag }}" latest

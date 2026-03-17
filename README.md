@@ -1,13 +1,31 @@
 # docker-net-dhcp
-
 `docker-net-dhcp` is a Docker plugin providing a network driver which allocates IP addresses (IPv4 and optionally IPv6)
 via an existing DHCP server (e.g. your router).
+
+# Quickstart (Pre-built)
+
+If you just want to get started with the pre-built plugin on an `amd64` or `arm64` system:
+
+1. **Install the plugin:**
+   ```bash
+   docker plugin install ghcr.io/thehaven/docker-net-dhcp:release
+   ```
+2. **Create a network** (replace `br0` with your host bridge):
+   ```bash
+   docker network create -d ghcr.io/thehaven/docker-net-dhcp:release --ipam-driver null -o bridge=br0 my-dhcp-net
+   ```
+3. **Run a container:**
+   ```bash
+   docker run --rm -it --network my-dhcp-net alpine ip addr show eth0
+   ```
+
+---
+
+# Usage
 
 When configured correctly, this allows you to spin up a container (e.g. `docker run ...` or `docker-compose up ...`) and
 access it on your network as if it was any other machine! _Probably_ not a great idea for production, but it's pretty
 handy for home deployment.
-
-# Usage
 
 ## Installation
 

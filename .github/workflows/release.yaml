@@ -1,23 +1,39 @@
+name: Release
+
 on:
   push:
     tags:
       - 'v*'
 
-name: Release
-
 jobs:
   release:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     env:
-      DOCKER_REPO: ghcr.io/thehaven/docker-net-dhcp
-      PLATFORMS: linux/amd64,linux/386,linux/arm64,linux/arm/v7
+      PLUGIN_NAME: ghcr.io/thehaven/docker-net-dhcp
+      PLATFORMS: linux/amd64,linux/arm64/v8
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run Tests
+        run: make test
+
+      - name: Run Static Analysis
+        run: make verify
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Install script dependencies
         run: pip3 install -r scripts/requirements.txt
@@ -25,24 +41,29 @@ jobs:
       - id: vars
         name: Generate release vars
         run: |
-          echo "::set-output name=version::"$(echo "${{ github.ref }}" | sed -r 's|refs/tags/v(.+)|\1|')""
-          echo "Changelog: " > release.md
-          git log --pretty=format:" - %s" "$(git describe --tags --abbrev=0 ${{ github.event.ref }}^)"..${{ github.event.ref }} >> release.md
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          
+          # Generate simple changelog for the GitHub Release
+          echo "## Changes in ${VERSION}" > release.md
+          git log --pretty=format:"* %s (%h)" $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD >> release.md
 
-      - name: Tag with release
+      - name: Build and Push Tag
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          scripts/tag_multiarch_plugin.py -p $PLATFORMS "$DOCKER_REPO:latest" ${{ steps.vars.outputs.version }}
-          scripts/tag_multiarch_plugin.py -p $PLATFORMS "$DOCKER_REPO:latest" release
+          # Use Makefile approach as requested
+          make PLUGIN_TAG=${{ steps.vars.outputs.version }} push-multiarch
+          
+          # Also tag as 'release' for convenience
+          scripts/tag_multiarch_plugin.py -p "$PLATFORMS" "$PLUGIN_NAME:${{ steps.vars.outputs.version }}" release
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
-          release_name: docker-net-dhcp ${{ steps.vars.outputs.version }}
           body_path: release.md
+          name: v${{ steps.vars.outputs.version }}
+          tag_name: v${{ steps.vars.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
