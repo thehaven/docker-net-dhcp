@@ -241,37 +241,61 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 	for {
 		select {
 		case msg := <-msgChan:
-			if msg.Type == "container" && msg.Action == "create" {
+			if msg.Type == "container" && (msg.Action == "create" || msg.Action == "start") {
 				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
 
 				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				ctr, err := p.docker.ContainerInspect(inspectCtx, msg.Actor.ID)
 				cancel()
 				if err != nil {
-					log.WithError(err).WithField("name", name).Debug("Could not inspect created container for seed caching")
+					log.WithError(err).WithField("name", name).Debug("Could not inspect container for seed caching")
 					continue
 				}
 
 				hostname := ctr.Config.Hostname
-				// Docker defaults the internal hostname to the short container ID
-				// (first 12 hex chars) when the user does not set --hostname.
-				// Using that as the DHCP hostname would register the container ID in
-				// DNS instead of the container name.  Fall back to the container name
-				// so `docker run --name foo …` produces DNS entry foo.<domain>.
 				if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
 					hostname = name
 				}
 
-				// Docker only allows a single --network at container creation time.
-				// Additional networks are connected via `docker network connect`
-				// which fires a separate "network connect" event (not handled here
-				// since CreateEndpoint for multi-network requires a separate pending
-				// entry — out of scope for now). The primary network is in
-				// HostConfig.NetworkMode.
-				netName := string(ctr.HostConfig.NetworkMode)
-				if netName != "" && netName != "default" && netName != "bridge" &&
-					netName != "host" && netName != "none" {
-					p.registerPendingForNetwork(ctx, netName, name, hostname)
+				// For "create", handle the primary network.
+				// For "start", handle all networks connected to this container.
+				if msg.Action == "create" {
+					netName := string(ctr.HostConfig.NetworkMode)
+					if netName != "" && netName != "default" && netName != "bridge" &&
+						netName != "host" && netName != "none" {
+						p.registerPendingForNetwork(ctx, netName, name, hostname)
+					}
+				} else {
+					for netName, settings := range ctr.NetworkSettings.Networks {
+						p.registerPendingForNetwork(ctx, netName, name, hostname)
+						// Also store the endpoint mapping if we have it
+						if settings.EndpointID != "" {
+							p.cache.SetMetadata(settings.NetworkID, settings.EndpointID, ContainerMetadata{
+								Name:      name,
+								Hostname:  hostname,
+								CreatedAt: time.Now(),
+							})
+						}
+					}
+				}
+			} else if msg.Type == "network" && msg.Action == "connect" {
+				netID := msg.Actor.ID
+				ctrID := msg.Actor.Attributes["container"]
+				log.WithFields(log.Fields{
+					"network":   netID,
+					"container": ctrID,
+				}).Debug("Received network connect event")
+				
+				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				ctr, err := p.docker.ContainerInspect(inspectCtx, ctrID)
+				cancel()
+				if err == nil {
+					name := strings.TrimPrefix(ctr.Name, "/")
+					hostname := ctr.Config.Hostname
+					if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
+						hostname = name
+					}
+					p.registerPendingForNetwork(ctx, netID, name, hostname)
 				}
 			}
 		case err := <-errChan:

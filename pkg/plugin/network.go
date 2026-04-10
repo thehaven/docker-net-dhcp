@@ -78,6 +78,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		"endpoint_id": r.EndpointID[:12],
 		"network_id":  r.NetworkID[:12],
 	})
+	reqLog.Debugf("CreateEndpoint request: %+v", r)
 	res := CreateEndpointResponse{Interface: &EndpointInterface{}}
 
 	opts, err := p.netOptions(ctx, r.NetworkID)
@@ -94,7 +95,16 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	// This consumes the entry so it cannot poison subsequent dynamic-MAC
 	// containers on the same network (BUG-7 fix).
 	// The hostname is also propagated for DNS registration regardless of MAC source.
-	seedName, hostname := p.popPendingContainer(r.NetworkID)
+	var seedName, hostname string
+	// Wait for the pending queue to be populated (e.g. by container start/create events).
+	// We retry for up to 1 second to account for race conditions between events and API calls.
+	for i := 0; i < 10; i++ {
+		seedName, hostname = p.popPendingContainer(r.NetworkID)
+		if seedName != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	if seedName == "" {
 		// FALLBACK: If the pending queue is empty (e.g. container restart or plugin
@@ -103,45 +113,92 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// we first search by NetworkID and EndpointID in the network's container list.
 		
 		findInNetwork := func() bool {
-			n, err := p.docker.NetworkInspect(ctx, r.NetworkID, network.InspectOptions{Verbose: true})
-			if err != nil { return false }
-			for ctrID, epInfo := range n.Containers {
-				if epInfo.EndpointID == r.EndpointID {
-					inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-					defer cancel()
-					ctr, err := p.docker.ContainerInspect(inspectCtx, ctrID)
-					if err == nil {
-						seedName = strings.TrimPrefix(ctr.Name, "/")
-						hostname = ctr.Config.Hostname
-						if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
-							hostname = seedName
-						}
-						return true
-					}
-				}
-			}
-			return false
-		}
-
-		if !findInNetwork() {
-			// DEEP FALLBACK: List all containers and find the one connected to this network with this endpoint.
-			ctrs, err := p.docker.ContainerList(ctx, container.ListOptions{})
-			if err == nil {
-				for _, c := range ctrs {
-					if settings, ok := c.NetworkSettings.Networks[r.NetworkID]; ok {
-						if settings.EndpointID == r.EndpointID {
+			// Retry up to 5 times with a short delay to account for Docker state synchronization
+			for i := 0; i < 5; i++ {
+				n, err := p.docker.NetworkInspect(ctx, r.NetworkID, network.InspectOptions{Verbose: true})
+				if err == nil {
+					for ctrID, epInfo := range n.Containers {
+						if epInfo.EndpointID == r.EndpointID {
 							inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-							ctr, err := p.docker.ContainerInspect(inspectCtx, c.ID)
-							cancel()
+							defer cancel()
+							ctr, err := p.docker.ContainerInspect(inspectCtx, ctrID)
 							if err == nil {
 								seedName = strings.TrimPrefix(ctr.Name, "/")
 								hostname = ctr.Config.Hostname
 								if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
 									hostname = seedName
 								}
+								return true
 							}
+						}
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			return false
+		}
+
+		if !findInNetwork() {
+			// DEEP FALLBACK: List all containers and find one connected to this network that lacks an endpoint.
+			// This typically happens during container restart/start where CreateEndpoint is called 
+			// before the container's operational state is updated with the new endpoint ID.
+			ctrs, err := p.docker.ContainerList(ctx, container.ListOptions{All: true})
+			if err == nil {
+				var candidates []container.Summary
+				for _, c := range ctrs {
+					// container.Summary.NetworkSettings.Networks is keyed by network name, not ID.
+					// We must iterate and find the network that matches r.NetworkID.
+					var settings *network.EndpointSettings
+					for name, netSettings := range c.NetworkSettings.Networks {
+						if netSettings.NetworkID == r.NetworkID || name == r.NetworkID {
+							settings = netSettings
 							break
 						}
+					}
+					
+					if settings != nil {
+						reqLog.Debugf("Found candidate container %s (%s) on network with endpointID %q", c.Names[0], c.ID[:12], settings.EndpointID)
+						// If the container is on this network but doesn't have an endpoint yet,
+						// or it matches our current endpoint (rare race), it's a candidate.
+						if settings.EndpointID == "" || settings.EndpointID == r.EndpointID {
+							candidates = append(candidates, c)
+						}
+					}
+				}
+				
+				reqLog.Debugf("Deep fallback found %d candidates", len(candidates))
+				// If we found exactly one candidate, use it. 
+				// If multiple, we can't be sure, so we'll fall back to EndpointID seed later.
+				if len(candidates) == 1 {
+					c := candidates[0]
+					if len(c.Names) > 0 {
+						seedName = strings.TrimPrefix(c.Names[0], "/")
+						// Hostname fallback: use container name if hostname not easily available
+						hostname = seedName
+						
+						reqLog.Debugf("Deep fallback resolved container info from summary: name=%q", seedName)
+						
+						// Try to get more info (hostname) via Inspect in background, but don't block
+						go func(id string) {
+							inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+							ctr, err := p.docker.ContainerInspect(inspectCtx, id)
+							if err == nil {
+								// We can't update seedName/hostname here as it's already used,
+								// but we could update joinHints if needed.
+								// For now, the name is enough for the MAC.
+								p.Lock()
+								hint := p.joinHints[r.EndpointID]
+								if hint.Hostname == "" || hint.Hostname == seedName {
+									hint.Hostname = ctr.Config.Hostname
+									if len(ctr.ID) >= 12 && hint.Hostname == ctr.ID[:12] {
+										hint.Hostname = seedName
+									}
+									p.joinHints[r.EndpointID] = hint
+								}
+								p.Unlock()
+							}
+						}(c.ID)
 					}
 				}
 			}
