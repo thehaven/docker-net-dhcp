@@ -22,6 +22,7 @@ type EndpointState struct {
 	IPv6       string `json:"ipv6,omitempty"`
 	Gateway    string `json:"gateway"`
 	Hostname   string `json:"hostname,omitempty"` // persisted for DHCP registration on recovery
+	SeedName   string `json:"seed_name,omitempty"` // container name used as MAC seed; persisted for Leave pre-population
 }
 
 // ContainerMetadata stores stable seeds for MAC generation
@@ -218,6 +219,18 @@ func (c *NetworkCache) Set(state NetworkState) error {
 	}
 	c.networks[state.ID] = state
 	return c.save()
+}
+
+// GetEndpoint retrieves an endpoint state from the cache. Returns zero value and false if not found.
+func (c *NetworkCache) GetEndpoint(networkID, endpointID string) (EndpointState, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	net, ok := c.networks[networkID]
+	if !ok || net.Endpoints == nil {
+		return EndpointState{}, false
+	}
+	ep, found := net.Endpoints[endpointID]
+	return ep, found
 }
 
 // SetEndpoint adds or updates an endpoint state within a network.

@@ -244,6 +244,113 @@ func TestPendingQueue_StaticMACConsumesPendingEntry(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// C1: SeedName persisted in EndpointState (cache round-trip)
+// ---------------------------------------------------------------------------
+
+// TestEndpointState_SeedNamePersisted verifies that SeedName survives a
+// cache set → get round-trip. Leave pre-population (C2) depends on this.
+func TestEndpointState_SeedNamePersisted(t *testing.T) {
+	c := NewNetworkCache(t.TempDir() + "/test-cache.json")
+
+	netID := "net-seed-test"
+	_ = c.Set(NetworkState{ID: netID, Options: DHCPNetworkOptions{Bridge: "br0"}})
+
+	ep := EndpointState{
+		ID:       "ep-001",
+		Hostname: "my-container",
+		SeedName: "my-container",
+	}
+	if err := c.SetEndpoint(netID, ep); err != nil {
+		t.Fatalf("SetEndpoint: %v", err)
+	}
+
+	state, ok := c.Get(netID)
+	if !ok {
+		t.Fatal("network not found in cache after Set")
+	}
+	got, ok := state.Endpoints["ep-001"]
+	if !ok {
+		t.Fatal("endpoint not found in cache after SetEndpoint")
+	}
+	if got.SeedName != "my-container" {
+		t.Errorf("SeedName round-trip = %q, want \"my-container\"", got.SeedName)
+	}
+	if got.Hostname != "my-container" {
+		t.Errorf("Hostname round-trip = %q, want \"my-container\"", got.Hostname)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C2: Leave pre-populates pending queue for restart
+// ---------------------------------------------------------------------------
+
+// TestLeavePrePopulatesPendingQueue verifies that Leave pushes the container
+// name from the cached EndpointState into the pending queue so the subsequent
+// CreateEndpoint call (during restart) can pop it immediately.
+func TestLeavePrePopulatesPendingQueue(t *testing.T) {
+	cacheDir := t.TempDir()
+	c := NewNetworkCache(cacheDir + "/test-cache.json")
+
+	netID := "net-leave-test"
+	epID := "ep-leave-001"
+	_ = c.Set(NetworkState{ID: netID, Options: DHCPNetworkOptions{Bridge: "br0"}})
+	_ = c.SetEndpoint(netID, EndpointState{
+		ID:       epID,
+		SeedName: "my-service",
+		Hostname: "my-service",
+	})
+
+	p := &Plugin{
+		pendingByNetwork: make(map[string][]pendingContainer),
+		joinHints:        make(map[string]joinHint),
+		persistentDHCP:   make(map[string]*dhcpManager),
+		cache:            c,
+	}
+
+	// Simulate Leave — should push container name to pending queue.
+	_ = p.Leave(nil, LeaveRequest{NetworkID: netID, EndpointID: epID})
+
+	name, hostname := p.popPendingContainer(netID)
+	if name != "my-service" {
+		t.Errorf("Leave pre-population: seedName = %q, want \"my-service\"", name)
+	}
+	if hostname != "my-service" {
+		t.Errorf("Leave pre-population: hostname = %q, want \"my-service\"", hostname)
+	}
+}
+
+// TestLeaveNoSeedNameSkipsPrePopulation verifies that Leave does NOT push
+// to the pending queue when the cached endpoint has no SeedName (e.g. old
+// cache format before C1 was deployed).
+func TestLeaveNoSeedNameSkipsPrePopulation(t *testing.T) {
+	cacheDir := t.TempDir()
+	c := NewNetworkCache(cacheDir + "/test-cache.json")
+
+	netID := "net-leave-noseed"
+	epID := "ep-leave-002"
+	_ = c.Set(NetworkState{ID: netID, Options: DHCPNetworkOptions{Bridge: "br0"}})
+	_ = c.SetEndpoint(netID, EndpointState{
+		ID:       epID,
+		Hostname: "old-format-host",
+		// SeedName intentionally empty — old cache format
+	})
+
+	p := &Plugin{
+		pendingByNetwork: make(map[string][]pendingContainer),
+		joinHints:        make(map[string]joinHint),
+		persistentDHCP:   make(map[string]*dhcpManager),
+		cache:            c,
+	}
+
+	_ = p.Leave(nil, LeaveRequest{NetworkID: netID, EndpointID: epID})
+
+	name, _ := p.popPendingContainer(netID)
+	if name != "" {
+		t.Errorf("Leave with empty SeedName should not pre-populate, got %q", name)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // BUG-6b: default container hostname (short ID) must be replaced with
 // container name so DNS registers as <name>.<domain> not <id>.<domain>
 // ---------------------------------------------------------------------------

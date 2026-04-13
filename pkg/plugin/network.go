@@ -74,11 +74,17 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 }
 
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
+	// Serialize CreateEndpoint calls to enable process-of-elimination when
+	// multiple containers restart concurrently (C4).
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
 	reqLog := log.WithFields(log.Fields{
 		"endpoint_id": r.EndpointID[:12],
 		"network_id":  r.NetworkID[:12],
 	})
 	reqLog.Debugf("CreateEndpoint request: %+v", r)
+	reqLog.Debugf("CreateEndpoint Options map: %+v", r.Options)
 	res := CreateEndpointResponse{Interface: &EndpointInterface{}}
 
 	opts, err := p.netOptions(ctx, r.NetworkID)
@@ -97,13 +103,13 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	// The hostname is also propagated for DNS registration regardless of MAC source.
 	var seedName, hostname string
 	// Wait for the pending queue to be populated (e.g. by container start/create events).
-	// We retry for up to 1 second to account for race conditions between events and API calls.
-	for i := 0; i < 10; i++ {
+	// We retry for up to 3 seconds to account for race conditions between events and API calls.
+	for i := 0; i < 15; i++ {
 		seedName, hostname = p.popPendingContainer(r.NetworkID)
 		if seedName != "" {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	if seedName == "" {
@@ -113,8 +119,8 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// we first search by NetworkID and EndpointID in the network's container list.
 		
 		findInNetwork := func() bool {
-			// Retry up to 5 times with a short delay to account for Docker state synchronization
-			for i := 0; i < 5; i++ {
+			// Retry up to 10 times with a short delay to account for Docker state synchronization
+			for i := 0; i < 10; i++ {
 				n, err := p.docker.NetworkInspect(ctx, r.NetworkID, network.InspectOptions{Verbose: true})
 				if err == nil {
 					for ctrID, epInfo := range n.Containers {
@@ -139,15 +145,26 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		}
 
 		if !findInNetwork() {
-			// DEEP FALLBACK: List all containers and find one connected to this network that lacks an endpoint.
-			// This typically happens during container restart/start where CreateEndpoint is called 
-			// before the container's operational state is updated with the new endpoint ID.
+			// DEEP FALLBACK (C5): List all containers on this network and use
+			// process-of-elimination to find the one without an assigned endpoint.
+			// Because CreateEndpoint calls are serialized (C4), each call sees
+			// endpoints that previous calls have already claimed — narrowing the
+			// candidate set with every iteration.
 			ctrs, err := p.docker.ContainerList(ctx, container.ListOptions{All: true})
 			if err == nil {
+				// Collect names already claimed by in-flight CreateEndpoint calls
+				// (visible in joinHints.SeedName, set at the end of CreateEndpoint).
+				p.RLock()
+				claimedNames := make(map[string]bool, len(p.joinHints))
+				for _, hint := range p.joinHints {
+					if hint.SeedName != "" {
+						claimedNames[hint.SeedName] = true
+					}
+				}
+				p.RUnlock()
+
 				var candidates []container.Summary
 				for _, c := range ctrs {
-					// container.Summary.NetworkSettings.Networks is keyed by network name, not ID.
-					// We must iterate and find the network that matches r.NetworkID.
 					var settings *network.EndpointSettings
 					for name, netSettings := range c.NetworkSettings.Networks {
 						if netSettings.NetworkID == r.NetworkID || name == r.NetworkID {
@@ -155,38 +172,47 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 							break
 						}
 					}
-					
-					if settings != nil {
-						reqLog.Debugf("Found candidate container %s (%s) on network with endpointID %q", c.Names[0], c.ID[:12], settings.EndpointID)
-						// If the container is on this network but doesn't have an endpoint yet,
-						// or it matches our current endpoint (rare race), it's a candidate.
-						if settings.EndpointID == "" || settings.EndpointID == r.EndpointID {
-							candidates = append(candidates, c)
-						}
+					if settings == nil {
+						continue
 					}
+
+					ctrName := ""
+					if len(c.Names) > 0 {
+						ctrName = strings.TrimPrefix(c.Names[0], "/")
+					}
+
+					reqLog.Debugf("Candidate container %s (%s) endpointID=%q", ctrName, c.ID[:12], settings.EndpointID)
+
+					// Skip containers that already have a different endpoint assigned.
+					if settings.EndpointID != "" && settings.EndpointID != r.EndpointID {
+						continue
+					}
+
+					// C5: Skip containers already claimed by a prior CreateEndpoint in this batch.
+					if claimedNames[ctrName] {
+						reqLog.Debugf("Skipping %s — already claimed in joinHints", ctrName)
+						continue
+					}
+
+					candidates = append(candidates, c)
 				}
-				
-				reqLog.Debugf("Deep fallback found %d candidates", len(candidates))
-				// If we found exactly one candidate, use it. 
-				// If multiple, we can't be sure, so we'll fall back to EndpointID seed later.
+
+				reqLog.Debugf("Deep fallback found %d candidates after elimination", len(candidates))
+
 				if len(candidates) == 1 {
 					c := candidates[0]
 					if len(c.Names) > 0 {
 						seedName = strings.TrimPrefix(c.Names[0], "/")
-						// Hostname fallback: use container name if hostname not easily available
 						hostname = seedName
-						
-						reqLog.Debugf("Deep fallback resolved container info from summary: name=%q", seedName)
-						
-						// Try to get more info (hostname) via Inspect in background, but don't block
+
+						reqLog.WithField("container", seedName).Debug("Deep fallback resolved single remaining container")
+
+						// Inspect in background to refine hostname for DHCP registration.
 						go func(id string) {
 							inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 							defer cancel()
 							ctr, err := p.docker.ContainerInspect(inspectCtx, id)
 							if err == nil {
-								// We can't update seedName/hostname here as it's already used,
-								// but we could update joinHints if needed.
-								// For now, the name is enough for the MAC.
 								p.Lock()
 								hint := p.joinHints[r.EndpointID]
 								if hint.Hostname == "" || hint.Hostname == seedName {
@@ -200,6 +226,11 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 							}
 						}(c.ID)
 					}
+				} else if len(candidates) > 1 {
+					// Multiple candidates remain — cannot safely determine which
+					// container this endpoint belongs to. Fall through to EndpointID
+					// seed rather than risk assigning the wrong container's MAC.
+					reqLog.Warnf("Deep fallback: %d candidates remain after elimination; refusing to guess", len(candidates))
 				}
 			}
 		}
@@ -214,9 +245,11 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 
 	// Store hostname in joinHints so Join can pass it to DHCP client for
 	// DNS registration (Option 12 + Option 81).
+	// Also store seedName so Join can persist it in the cache for Leave pre-population.
 	p.Lock()
 	hint := p.joinHints[r.EndpointID]
 	hint.Hostname = hostname
+	hint.SeedName = seedName
 	p.joinHints[r.EndpointID] = hint
 	p.Unlock()
 
@@ -389,6 +422,47 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	p.Unlock()
 
 	if !ok { return res, util.ErrNoHint }
+
+	// C6: If hostname is empty (CreateEndpoint couldn't resolve the container),
+	// attempt recovery by matching SandboxKey against running containers.
+	if hint.Hostname == "" && r.SandboxKey != "" {
+		reqLog.Debug("Hostname empty in joinHint, attempting SandboxKey recovery")
+		ctrs, err := p.docker.ContainerList(ctx, container.ListOptions{})
+		if err == nil {
+			for _, c := range ctrs {
+				if c.NetworkSettings != nil {
+					for _, netSettings := range c.NetworkSettings.Networks {
+						// Match by EndpointID directly — most reliable.
+						if netSettings.EndpointID == r.EndpointID {
+							inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+							ctr, err := p.docker.ContainerInspect(inspectCtx, c.ID)
+							cancel()
+							if err == nil {
+								name := strings.TrimPrefix(ctr.Name, "/")
+								hn := ctr.Config.Hostname
+								if len(ctr.ID) >= 12 && hn == ctr.ID[:12] {
+									hn = name
+								}
+								hint.Hostname = hn
+								if hint.SeedName == "" {
+									hint.SeedName = name
+								}
+								reqLog.WithFields(log.Fields{
+									"container": name,
+									"hostname":  hn,
+								}).Debug("Recovered hostname via SandboxKey/EndpointID fallback")
+							}
+							break
+						}
+					}
+				}
+				if hint.Hostname != "" {
+					break
+				}
+			}
+		}
+	}
+
 	if hint.Gateway != "" { res.Gateway = hint.Gateway }
 	bridge, err := netlink.LinkByName(opts.Bridge)
 	if err == nil {
@@ -424,6 +498,7 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			IP:         ipStr,
 			Gateway:    hint.Gateway,
 			Hostname:   hint.Hostname,
+			SeedName:   hint.SeedName,
 		}
 		_ = p.cache.SetEndpoint(r.NetworkID, ep)
 	}()
@@ -432,6 +507,19 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 }
 
 func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
+	// Pre-populate pending queue for potential restart. Docker's restart sequence
+	// is Leave → DeleteEndpoint → CreateEndpoint → Join, and Leave fires before
+	// CreateEndpoint for the same container. By pushing the container name now,
+	// CreateEndpoint can pop it immediately from the FIFO queue.
+	if ep, ok := p.cache.GetEndpoint(r.NetworkID, r.EndpointID); ok && ep.SeedName != "" {
+		p.pushPendingContainer(r.NetworkID, ep.SeedName, ep.Hostname)
+		log.WithFields(log.Fields{
+			"endpoint":  r.EndpointID[:12],
+			"network":   r.NetworkID[:12],
+			"container": ep.SeedName,
+		}).Debug("Pre-populated pending queue from Leave for potential restart")
+	}
+
 	p.Lock()
 	manager, ok := p.persistentDHCP[r.EndpointID]
 	if ok { delete(p.persistentDHCP, r.EndpointID) }

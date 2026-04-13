@@ -73,6 +73,7 @@ type joinHint struct {
 	IPv6     *netlink.Addr
 	Gateway  string
 	Hostname string // container hostname, propagated to DHCP Option 12 / Option 81
+	SeedName string // container name used as MAC seed, persisted for Leave pre-population
 }
 
 // pendingContainer holds transient info about a container that has been
@@ -97,6 +98,11 @@ type Plugin struct {
 	persistentDHCP map[string]*dhcpManager
 
 	cache *NetworkCache
+
+	// createMu serializes CreateEndpoint calls. This enables process-of-elimination
+	// when multiple containers restart concurrently: after each call completes and
+	// records its endpoint, the next call sees one fewer untracked container.
+	createMu sync.Mutex
 
 	// Per-network FIFO queue of recently created containers awaiting endpoint
 	// assignment. Keyed by Docker network UUID. Populated by watchDockerEvents,
@@ -231,9 +237,9 @@ func (p *Plugin) pruneExpiredPending(maxAge time.Duration) {
 // Docker event listener
 // ---------------------------------------------------------------------------
 
-// watchDockerEvents listens for container create events and pre-populates the
+// watchDockerEvents listens for container lifecycle events and pre-populates the
 // per-network pending queue so that CreateEndpoint can resolve the container
-// name for deterministic MAC generation.
+// name for deterministic MAC generation and DHCP hostname registration.
 func (p *Plugin) watchDockerEvents(ctx context.Context) {
 	log.Info("Starting Docker event listener for container name pre-caching...")
 	msgChan, errChan := p.docker.Events(ctx, events.ListOptions{})
@@ -278,6 +284,30 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 						}
 					}
 				}
+			} else if msg.Type == "container" && msg.Action == "die" {
+				// C3: Pre-populate pending queue on container death so that a
+				// subsequent restart has the name available before CreateEndpoint.
+				// This is belt-and-suspenders with Leave pre-population (C2) —
+				// it covers cases where the cache was stale or empty.
+				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
+				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				ctr, err := p.docker.ContainerInspect(inspectCtx, msg.Actor.ID)
+				cancel()
+				if err != nil {
+					log.WithError(err).WithField("name", name).Debug("Could not inspect dying container for seed caching")
+					continue
+				}
+
+				hostname := ctr.Config.Hostname
+				if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
+					hostname = name
+				}
+
+				for netName := range ctr.NetworkSettings.Networks {
+					p.registerPendingForNetwork(ctx, netName, name, hostname)
+				}
+
+				log.WithField("container", name).Debug("Pre-populated pending queue from die event")
 			} else if msg.Type == "network" && msg.Action == "connect" {
 				netID := msg.Actor.ID
 				ctrID := msg.Actor.Attributes["container"]
