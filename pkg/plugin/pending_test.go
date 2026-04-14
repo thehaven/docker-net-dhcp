@@ -8,113 +8,339 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// BUG-1 / BUG-2: per-network FIFO pending queue
+// FIFO queue: push, pop, dedup, forward-flush
 // ---------------------------------------------------------------------------
 
-// TestPendingQueue_FIFO verifies oldest container is popped first (FIFO, not LIFO).
-// The previous creationQueue used tail-read (LIFO) which assigned wrong names
-// under concurrent or multi-network scenarios.
-func TestPendingQueue_FIFO(t *testing.T) {
+// TestFIFO_BasicPushPop verifies FIFO ordering of the pending queue.
+func TestFIFO_BasicPushPop(t *testing.T) {
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
 	}
 
-	p.pushPendingContainer("net-123", "container-A", "host-A")
-	p.pushPendingContainer("net-123", "container-B", "host-B")
+	p.pushPendingContainer("net-1", "alpha", "h-alpha", true)
+	p.pushPendingContainer("net-1", "bravo", "h-bravo", true)
+	p.pushPendingContainer("net-1", "charlie", "h-charlie", true)
 
-	name, _ := p.popPendingContainer("net-123")
-	if name != "container-A" {
-		t.Errorf("first pop (FIFO) = %q, want \"container-A\"", name)
+	name, hn, ok := p.popPendingContainer("net-1")
+	if !ok || name != "alpha" || hn != "h-alpha" {
+		t.Errorf("pop#1 = (%q, %q, %v), want (alpha, h-alpha, true)", name, hn, ok)
 	}
-	name, _ = p.popPendingContainer("net-123")
-	if name != "container-B" {
-		t.Errorf("second pop = %q, want \"container-B\"", name)
+
+	name, hn, ok = p.popPendingContainer("net-1")
+	if !ok || name != "bravo" || hn != "h-bravo" {
+		t.Errorf("pop#2 = (%q, %q, %v), want (bravo, h-bravo, true)", name, hn, ok)
+	}
+
+	name, hn, ok = p.popPendingContainer("net-1")
+	if !ok || name != "charlie" || hn != "h-charlie" {
+		t.Errorf("pop#3 = (%q, %q, %v), want (charlie, h-charlie, true)", name, hn, ok)
+	}
+
+	_, _, ok = p.popPendingContainer("net-1")
+	if ok {
+		t.Error("pop#4 should return false on empty queue")
 	}
 }
 
-// TestPendingQueue_PopOnRead verifies that popping a container removes it.
-// The previous creationQueue never consumed entries — same stale name was
-// reused for every subsequent CreateEndpoint call.
-func TestPendingQueue_PopOnRead(t *testing.T) {
+// TestFIFO_Dedup verifies that pushing the same name removes the old entry
+// and appends at the end.
+func TestFIFO_Dedup(t *testing.T) {
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
 	}
 
-	p.pushPendingContainer("net-456", "container-X", "host-X")
+	p.pushPendingContainer("net-1", "alpha", "h1", true)
+	p.pushPendingContainer("net-1", "bravo", "h2", true)
+	p.pushPendingContainer("net-1", "alpha", "h1-updated", true) // dedup: removes old alpha
 
-	name1, _ := p.popPendingContainer("net-456")
-	if name1 != "container-X" {
-		t.Fatalf("first pop = %q, want \"container-X\"", name1)
+	// Queue should be: [bravo, alpha(updated)]
+	name, hn, ok := p.popPendingContainer("net-1")
+	if !ok || name != "bravo" {
+		t.Errorf("pop#1 = (%q, %q, %v), want (bravo, ...)", name, hn, ok)
 	}
 
-	// Queue must be empty after the first pop.
-	name2, _ := p.popPendingContainer("net-456")
-	if name2 != "" {
-		t.Errorf("second pop on drained queue = %q, want \"\"", name2)
+	name, hn, ok = p.popPendingContainer("net-1")
+	if !ok || name != "alpha" || hn != "h1-updated" {
+		t.Errorf("pop#2 = (%q, %q, %v), want (alpha, h1-updated, true)", name, hn, ok)
 	}
 }
 
-// TestPendingQueue_EmptyReturnsEmpty verifies pop on missing network returns ("","").
-func TestPendingQueue_EmptyReturnsEmpty(t *testing.T) {
+// TestFIFO_ForwardFlushesBackward verifies that pushing a forward-looking
+// event flushes all backward-looking entries. This prevents compose-down
+// contamination: die/Leave entries are cleared when create events arrive.
+func TestFIFO_ForwardFlushesBackward(t *testing.T) {
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
 	}
 
-	name, hostname := p.popPendingContainer("nonexistent-network")
-	if name != "" || hostname != "" {
-		t.Errorf("pop on empty = (%q, %q), want (\"\", \"\")", name, hostname)
+	// Simulate compose down: die/Leave events (backward-looking)
+	p.pushPendingContainer("net-1", "stale-A", "h-stale-A", false)
+	p.pushPendingContainer("net-1", "stale-B", "h-stale-B", false)
+	p.pushPendingContainer("net-1", "unrelated", "h-unrelated", false)
+
+	// Simulate compose up: first create event (forward-looking) flushes backward entries
+	p.pushPendingContainer("net-1", "fresh-A", "h-fresh-A", true)
+	p.pushPendingContainer("net-1", "fresh-B", "h-fresh-B", true)
+
+	// Queue should only have fresh entries
+	name, _, ok := p.popPendingContainer("net-1")
+	if !ok || name != "fresh-A" {
+		t.Errorf("pop#1 = %q, want fresh-A (backward entries should be flushed)", name)
+	}
+
+	name, _, ok = p.popPendingContainer("net-1")
+	if !ok || name != "fresh-B" {
+		t.Errorf("pop#2 = %q, want fresh-B", name)
+	}
+
+	_, _, ok = p.popPendingContainer("net-1")
+	if ok {
+		t.Error("pop#3 should be empty — all backward entries were flushed")
 	}
 }
 
-// TestPendingQueue_NetworkIsolation verifies containers on different networks
+// TestFIFO_BackwardSurvivesWithoutForward verifies that backward-looking
+// entries (die/Leave) remain in the queue when no forward event follows.
+// This is the docker-restart case: die fires, CreateEndpoint pops it.
+func TestFIFO_BackwardSurvivesWithoutForward(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	// Simulate docker restart: die event pushes backward entry
+	p.pushPendingContainer("net-1", "restarting-svc", "h-restart", false)
+
+	// No forward events follow — entry survives
+	name, hn, ok := p.popPendingContainer("net-1")
+	if !ok || name != "restarting-svc" || hn != "h-restart" {
+		t.Errorf("pop = (%q, %q, %v), want (restarting-svc, h-restart, true)", name, hn, ok)
+	}
+}
+
+// TestFIFO_NetworkIsolation verifies queues are independent per network.
+func TestFIFO_NetworkIsolation(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	p.pushPendingContainer("net-A", "svc-A", "h-A", true)
+	p.pushPendingContainer("net-B", "svc-B", "h-B", true)
+
+	name, _, _ := p.popPendingContainer("net-A")
+	if name != "svc-A" {
+		t.Errorf("net-A pop = %q, want svc-A", name)
+	}
+
+	name, _, _ = p.popPendingContainer("net-B")
+	if name != "svc-B" {
+		t.Errorf("net-B pop = %q, want svc-B", name)
+	}
+}
+
+// TestFIFO_ComposeDownUpScenario is an end-to-end test simulating the exact
+// sequence that caused the original bug: compose down → compose up.
+func TestFIFO_ComposeDownUpScenario(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	netID := "net-vlan107"
+
+	// Phase 1: compose down — die/Leave events fire for 5 containers
+	p.pushPendingContainer(netID, "mem0-server", "mem0-server", false)
+	p.pushPendingContainer(netID, "mem0-redis", "mem0-redis", false)
+	p.pushPendingContainer(netID, "mem0-postgres", "mem0-postgres", false)
+	p.pushPendingContainer(netID, "mem0-mcp", "mem0-mcp", false)
+	p.pushPendingContainer(netID, "mem0-qdrant", "mem0-qdrant", false)
+	// Cross-project pollution
+	p.pushPendingContainer(netID, "freshrss", "freshrss", false)
+
+	// Phase 2: compose up — create events fire for containers.
+	// First forward event flushes ALL backward entries.
+	p.pushPendingContainer(netID, "mem0-qdrant", "mem0-qdrant", true)
+	p.pushPendingContainer(netID, "mem0-postgres", "mem0-postgres", true)
+	p.pushPendingContainer(netID, "mem0-redis", "mem0-redis", true)
+	p.pushPendingContainer(netID, "mem0-mcp", "mem0-mcp", true)
+	p.pushPendingContainer(netID, "mem0-neo4j", "mem0-neo4j", true)
+
+	// Phase 3: CreateEndpoint pops — should get ONLY fresh compose-up entries
+	expected := []string{"mem0-qdrant", "mem0-postgres", "mem0-redis", "mem0-mcp", "mem0-neo4j"}
+	for i, want := range expected {
+		name, _, ok := p.popPendingContainer(netID)
+		if !ok {
+			t.Fatalf("pop#%d: unexpected empty queue (wanted %q)", i+1, want)
+		}
+		if name != want {
+			t.Errorf("pop#%d = %q, want %q", i+1, name, want)
+		}
+	}
+
+	// Queue should be empty — no freshrss contamination
+	_, _, ok := p.popPendingContainer(netID)
+	if ok {
+		t.Error("queue should be empty after all compose-up entries consumed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metadata map: upsert, lookup, isolation, staleness
+// ---------------------------------------------------------------------------
+
+// TestMetadataMap_UpsertOverwrites verifies last-write-wins semantics.
+func TestMetadataMap_UpsertOverwrites(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	p.upsertPendingMeta("net-123", "my-service", "old-hostname")
+	p.upsertPendingMeta("net-123", "my-service", "new-hostname")
+
+	hostname, ok := p.lookupPendingMeta("net-123", "my-service")
+	if !ok {
+		t.Fatal("expected entry to exist after upsert")
+	}
+	if hostname != "new-hostname" {
+		t.Errorf("upsert hostname = %q, want \"new-hostname\" (last-write-wins)", hostname)
+	}
+}
+
+// TestMetadataMap_LookupByName verifies keyed lookup.
+func TestMetadataMap_LookupByName(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	p.upsertPendingMeta("net-123", "container-A", "host-A")
+	p.upsertPendingMeta("net-123", "container-B", "host-B")
+
+	hostname, ok := p.lookupPendingMeta("net-123", "container-B")
+	if !ok || hostname != "host-B" {
+		t.Errorf("lookup(container-B) = (%q, %v), want (host-B, true)", hostname, ok)
+	}
+
+	hostname, ok = p.lookupPendingMeta("net-123", "container-A")
+	if !ok || hostname != "host-A" {
+		t.Errorf("lookup(container-A) = (%q, %v), want (host-A, true)", hostname, ok)
+	}
+}
+
+// TestMetadataMap_LookupNonexistent verifies lookup on missing entries.
+func TestMetadataMap_LookupNonexistent(t *testing.T) {
+	p := &Plugin{
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+	}
+
+	_, ok := p.lookupPendingMeta("nonexistent-network", "any-container")
+	if ok {
+		t.Error("expected ok=false for nonexistent network")
+	}
+
+	p.upsertPendingMeta("net-123", "container-A", "host-A")
+	_, ok = p.lookupPendingMeta("net-123", "nonexistent-container")
+	if ok {
+		t.Error("expected ok=false for nonexistent container")
+	}
+}
+
+// TestMetadataMap_NetworkIsolation verifies containers on different networks
 // do not interfere with each other.
-func TestPendingQueue_NetworkIsolation(t *testing.T) {
+func TestMetadataMap_NetworkIsolation(t *testing.T) {
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
 	}
 
-	p.pushPendingContainer("net-A", "ctr-in-A", "h-A")
-	p.pushPendingContainer("net-B", "ctr-in-B", "h-B")
+	p.upsertPendingMeta("net-A", "shared-name", "host-from-A")
+	p.upsertPendingMeta("net-B", "shared-name", "host-from-B")
 
-	nameB, _ := p.popPendingContainer("net-B")
-	if nameB != "ctr-in-B" {
-		t.Fatalf("net-B pop = %q, want \"ctr-in-B\"", nameB)
+	hostname, ok := p.lookupPendingMeta("net-A", "shared-name")
+	if !ok || hostname != "host-from-A" {
+		t.Errorf("net-A lookup = (%q, %v), want (\"host-from-A\", true)", hostname, ok)
 	}
 
-	nameA, _ := p.popPendingContainer("net-A")
-	if nameA != "ctr-in-A" {
-		t.Errorf("net-A pop after net-B consumed = %q, want \"ctr-in-A\"", nameA)
+	hostname, ok = p.lookupPendingMeta("net-B", "shared-name")
+	if !ok || hostname != "host-from-B" {
+		t.Errorf("net-B lookup = (%q, %v), want (\"host-from-B\", true)", hostname, ok)
 	}
 }
 
-// TestPendingQueue_PruneExpired verifies stale entries are cleaned up.
-func TestPendingQueue_PruneExpired(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Pruning: both FIFO and metadata
+// ---------------------------------------------------------------------------
+
+// TestPruneExpired verifies stale entries are cleaned from both structures.
+func TestPruneExpired(t *testing.T) {
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
 	}
 
+	now := time.Now()
+
+	// Seed FIFO with stale and fresh entries
 	p.Lock()
-	p.pendingByNetwork["net-prune"] = []pendingContainer{
-		{name: "stale", hostname: "h-stale", createdAt: time.Now().Add(-10 * time.Second)},
-		{name: "fresh", hostname: "h-fresh", createdAt: time.Now()},
+	p.pendingQueue["net-prune"] = []pendingContainer{
+		{name: "stale-q", hostname: "h-stale-q", createdAt: now.Add(-10 * time.Second), forward: true},
+		{name: "fresh-q", hostname: "h-fresh-q", createdAt: now, forward: true},
+	}
+	// Seed metadata with stale and fresh entries
+	p.pendingMeta["net-prune"] = map[string]pendingContainer{
+		"stale-m": {name: "stale-m", hostname: "h-stale-m", createdAt: now.Add(-10 * time.Second)},
+		"fresh-m": {name: "fresh-m", hostname: "h-fresh-m", createdAt: now},
 	}
 	p.Unlock()
 
 	p.pruneExpiredPending(5 * time.Second)
 
-	name, _ := p.popPendingContainer("net-prune")
-	if name != "fresh" {
-		t.Errorf("after prune, pop = %q, want \"fresh\" (stale should have been removed)", name)
+	// FIFO: only fresh entry should remain
+	name, _, ok := p.popPendingContainer("net-prune")
+	if !ok || name != "fresh-q" {
+		t.Errorf("FIFO after prune: pop = (%q, %v), want (fresh-q, true)", name, ok)
+	}
+	_, _, ok = p.popPendingContainer("net-prune")
+	if ok {
+		t.Error("FIFO should have only 1 entry after prune")
+	}
+
+	// Metadata: stale entry pruned, fresh survives
+	_, ok = p.lookupPendingMeta("net-prune", "stale-m")
+	if ok {
+		t.Error("stale metadata entry should have been pruned")
+	}
+	hostname, ok := p.lookupPendingMeta("net-prune", "fresh-m")
+	if !ok || hostname != "h-fresh-m" {
+		t.Errorf("fresh metadata after prune: (%q, %v), want (\"h-fresh-m\", true)", hostname, ok)
 	}
 }
 
@@ -155,17 +381,12 @@ func TestIsDHCPPlugin_BackwardCompat(t *testing.T) {
 
 // TestMACParity_ContainerNameSeed verifies that macgen.Generate() with a container
 // name as seed produces bit-identical output to the shell generate_mac.func script.
-// Reference vectors taken from generate_mac.bats test suite.
 func TestMACParity_ContainerNameSeed(t *testing.T) {
 	tests := []struct {
 		seed string
 		want string
 	}{
-		// md5("test") = 098f6bcd4621d373cade4e832627b4f6
-		// first 5 bytes: 09 8f 6b cd 46 → prefixed with 02
 		{"test", "02:09:8f:6b:cd:46"},
-		// md5("container-1") = b588c219865f6fe336908e5991216b13
-		// first 5 bytes: b5 88 c2 19 86
 		{"container-1", "02:b5:88:c2:19:86"},
 	}
 
@@ -205,50 +426,9 @@ func TestMACParity_DotFormat(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-7: static-MAC container must consume pending queue entry
-// ---------------------------------------------------------------------------
-
-// TestPendingQueue_StaticMACConsumesPendingEntry verifies that when a user
-// specifies --mac-address for a container, the corresponding pending queue
-// entry is still consumed. Without this, the stale entry would be popped by
-// the next dynamic-MAC container on the same network, assigning it the wrong
-// container name as the MAC seed.
-//
-// Reproduces the observed failure:
-//   - push "test-mac-static" → pending[net]
-//   - push "test-mac-dyn"    → pending[net]
-//   - static container CreateEndpoint: MUST consume "test-mac-static"
-//   - dynamic container CreateEndpoint: MUST get "test-mac-dyn" (not "test-mac-static")
-func TestPendingQueue_StaticMACConsumesPendingEntry(t *testing.T) {
-	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
-	}
-
-	net := "net-static-bug"
-	p.pushPendingContainer(net, "test-mac-static", "host-static")
-	p.pushPendingContainer(net, "test-mac-dyn", "host-dyn")
-
-	// Simulate static-MAC CreateEndpoint: pop (and discard) the first entry.
-	// The caller (CreateEndpoint) pops first regardless of whether a static MAC
-	// is provided — this is the BUG-7 fix.
-	_, _ = p.popPendingContainer(net)
-
-	// Simulate dynamic-MAC CreateEndpoint: must get "test-mac-dyn".
-	name, _ := p.popPendingContainer(net)
-	if name != "test-mac-dyn" {
-		t.Errorf("dynamic container after static-MAC consumed queue entry: got %q, want \"test-mac-dyn\""+
-			" (stale static entry leaked into dynamic container MAC seed)", name)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // C1: SeedName persisted in EndpointState (cache round-trip)
 // ---------------------------------------------------------------------------
 
-// TestEndpointState_SeedNamePersisted verifies that SeedName survives a
-// cache set → get round-trip. Leave pre-population (C2) depends on this.
 func TestEndpointState_SeedNamePersisted(t *testing.T) {
 	c := NewNetworkCache(t.TempDir() + "/test-cache.json")
 
@@ -281,13 +461,10 @@ func TestEndpointState_SeedNamePersisted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C2: Leave pre-populates pending queue for restart
+// C2: Leave caches metadata for potential restart (both FIFO + metadata map)
 // ---------------------------------------------------------------------------
 
-// TestLeavePrePopulatesPendingQueue verifies that Leave pushes the container
-// name from the cached EndpointState into the pending queue so the subsequent
-// CreateEndpoint call (during restart) can pop it immediately.
-func TestLeavePrePopulatesPendingQueue(t *testing.T) {
+func TestLeaveCachesMetadata(t *testing.T) {
 	cacheDir := t.TempDir()
 	c := NewNetworkCache(cacheDir + "/test-cache.json")
 
@@ -301,28 +478,32 @@ func TestLeavePrePopulatesPendingQueue(t *testing.T) {
 	})
 
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
-		cache:            c,
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+		cache:          c,
 	}
 
-	// Simulate Leave — should push container name to pending queue.
 	_ = p.Leave(nil, LeaveRequest{NetworkID: netID, EndpointID: epID})
 
-	name, hostname := p.popPendingContainer(netID)
-	if name != "my-service" {
-		t.Errorf("Leave pre-population: seedName = %q, want \"my-service\"", name)
+	// Verify metadata map
+	hostname, ok := p.lookupPendingMeta(netID, "my-service")
+	if !ok {
+		t.Fatal("Leave should have cached metadata for my-service")
 	}
 	if hostname != "my-service" {
-		t.Errorf("Leave pre-population: hostname = %q, want \"my-service\"", hostname)
+		t.Errorf("Leave cached hostname = %q, want \"my-service\"", hostname)
+	}
+
+	// Verify FIFO queue (backward entry for restart support)
+	name, _, ok := p.popPendingContainer(netID)
+	if !ok || name != "my-service" {
+		t.Errorf("Leave FIFO entry = (%q, %v), want (my-service, true)", name, ok)
 	}
 }
 
-// TestLeaveNoSeedNameSkipsPrePopulation verifies that Leave does NOT push
-// to the pending queue when the cached endpoint has no SeedName (e.g. old
-// cache format before C1 was deployed).
-func TestLeaveNoSeedNameSkipsPrePopulation(t *testing.T) {
+func TestLeaveNoSeedNameSkipsCaching(t *testing.T) {
 	cacheDir := t.TempDir()
 	c := NewNetworkCache(cacheDir + "/test-cache.json")
 
@@ -332,53 +513,42 @@ func TestLeaveNoSeedNameSkipsPrePopulation(t *testing.T) {
 	_ = c.SetEndpoint(netID, EndpointState{
 		ID:       epID,
 		Hostname: "old-format-host",
-		// SeedName intentionally empty — old cache format
 	})
 
 	p := &Plugin{
-		pendingByNetwork: make(map[string][]pendingContainer),
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
-		cache:            c,
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+		cache:          c,
 	}
 
 	_ = p.Leave(nil, LeaveRequest{NetworkID: netID, EndpointID: epID})
 
-	name, _ := p.popPendingContainer(netID)
-	if name != "" {
-		t.Errorf("Leave with empty SeedName should not pre-populate, got %q", name)
+	_, ok := p.lookupPendingMeta(netID, "old-format-host")
+	if ok {
+		t.Error("Leave with empty SeedName should not cache metadata")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// BUG-6b: default container hostname (short ID) must be replaced with
-// container name so DNS registers as <name>.<domain> not <id>.<domain>
+// BUG-6b: default container hostname (short ID) → container name
 // ---------------------------------------------------------------------------
 
-// TestDefaultHostnameFallsBackToContainerName verifies that when the container's
-// internal hostname is Docker's default (first 12 chars of container ID), the
-// pending queue stores the container NAME instead, so the DHCP hostname option
-// produces DNS entry <name>.docker.<domain> rather than <id>.docker.<domain>.
 func TestDefaultHostnameFallsBackToContainerName(t *testing.T) {
-	// Simulate: containerID = "ddc7a5df6d79abcdef01234567890abc" (32+ chars)
-	// Docker default hostname = containerID[:12] = "ddc7a5df6d79"
 	containerID := "ddc7a5df6d79abcdef01234567890abcdef01234567890abc"
-	defaultHostname := containerID[:12] // "ddc7a5df6d79"
+	defaultHostname := containerID[:12]
 	containerName := "test-det-1"
 
-	// Apply the same logic as watchDockerEvents.
 	hostname := defaultHostname
 	if len(containerID) >= 12 && hostname == containerID[:12] {
 		hostname = containerName
 	}
 
 	if hostname != containerName {
-		t.Errorf("hostname with default container ID = %q, want container name %q"+
-			" (DNS would register as %q.<domain> instead of %q.<domain>)",
-			hostname, containerName, defaultHostname, containerName)
+		t.Errorf("hostname with default container ID = %q, want container name %q", hostname, containerName)
 	}
 
-	// When --hostname is set explicitly, it must be preserved.
 	explicitHostname := "my-custom-host"
 	hostname2 := explicitHostname
 	if len(containerID) >= 12 && hostname2 == containerID[:12] {

@@ -84,6 +84,7 @@ type pendingContainer struct {
 	name      string
 	hostname  string
 	createdAt time.Time
+	forward   bool // true = from create/start event (forward-looking); false = from die/Leave (backward-looking)
 }
 
 // Plugin is the DHCP network plugin
@@ -104,11 +105,19 @@ type Plugin struct {
 	// records its endpoint, the next call sees one fewer untracked container.
 	createMu sync.Mutex
 
-	// Per-network FIFO queue of recently created containers awaiting endpoint
-	// assignment. Keyed by Docker network UUID. Populated by watchDockerEvents,
-	// consumed (popped) by CreateEndpoint. This eliminates the previous global
-	// LIFO creationQueue that caused incorrect MAC seed assignment.
-	pendingByNetwork map[string][]pendingContainer
+	// Per-network FIFO queue of recently active containers. CreateEndpoint pops
+	// from the front. Entries carry a "forward" flag: create/start events are
+	// forward-looking (compose up); die/Leave events are backward-looking
+	// (docker restart). When the first create event fires for a network, all
+	// backward-looking entries are flushed so that stale compose-down entries
+	// never contaminate a subsequent compose up.
+	pendingQueue map[string][]pendingContainer
+
+	// Per-network metadata map keyed by container name. All events (create,
+	// start, die, Leave, network.connect) upsert here. Used for hostname
+	// enrichment after FIFO pop and as a secondary lookup when the FIFO is empty
+	// (e.g. network.connect arrives after FIFO was popped).
+	pendingMeta map[string]map[string]pendingContainer
 }
 
 // NewPlugin creates a new Plugin
@@ -126,7 +135,8 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 		joinHints:        make(map[string]joinHint),
 		persistentDHCP:   make(map[string]*dhcpManager),
 		cache:            NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
-		pendingByNetwork: make(map[string][]pendingContainer),
+		pendingQueue:     make(map[string][]pendingContainer),
+		pendingMeta:      make(map[string]map[string]pendingContainer),
 	}
 
 	// Immediate reconciliation to populate cache before recovery runs.
@@ -184,51 +194,127 @@ func (p *Plugin) apiHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Pending container queue — per-network FIFO
+// Pending container helpers — FIFO queue + metadata map
 // ---------------------------------------------------------------------------
 
-// pushPendingContainer enqueues a container into the FIFO pending list for
-// the given Docker network UUID.
-func (p *Plugin) pushPendingContainer(networkID, name, hostname string) {
+// pushPendingContainer appends a container to the FIFO queue for a network.
+// If an entry with the same name already exists, it is removed first (dedup).
+// When a forward-looking event (create/start) is pushed, any backward-looking
+// entries (die/Leave) are flushed first to prevent compose-down contamination.
+func (p *Plugin) pushPendingContainer(networkID, name, hostname string, forward bool) {
 	p.Lock()
 	defer p.Unlock()
-	p.pendingByNetwork[networkID] = append(p.pendingByNetwork[networkID], pendingContainer{
+
+	queue := p.pendingQueue[networkID]
+
+	// If this is a forward event, flush all backward entries (compose-down cleanup).
+	if forward {
+		filtered := queue[:0]
+		for _, pc := range queue {
+			if pc.forward {
+				filtered = append(filtered, pc)
+			}
+		}
+		queue = filtered
+	}
+
+	// Dedup: remove any existing entry with the same name.
+	deduped := queue[:0]
+	for _, pc := range queue {
+		if pc.name != name {
+			deduped = append(deduped, pc)
+		}
+	}
+
+	deduped = append(deduped, pendingContainer{
 		name:      name,
 		hostname:  hostname,
 		createdAt: time.Now(),
+		forward:   forward,
 	})
+	p.pendingQueue[networkID] = deduped
 }
 
-// popPendingContainer removes and returns the oldest pending container for
-// the given network UUID. Returns ("", "") when the queue is empty.
-func (p *Plugin) popPendingContainer(networkID string) (name, hostname string) {
+// popPendingContainer removes and returns the front entry of the FIFO queue.
+// Returns ("", "", false) when the queue is empty.
+func (p *Plugin) popPendingContainer(networkID string) (name, hostname string, ok bool) {
 	p.Lock()
 	defer p.Unlock()
-	queue := p.pendingByNetwork[networkID]
+	queue := p.pendingQueue[networkID]
 	if len(queue) == 0 {
-		return "", ""
+		return "", "", false
 	}
 	pc := queue[0]
-	p.pendingByNetwork[networkID] = queue[1:]
-	return pc.name, pc.hostname
+	p.pendingQueue[networkID] = queue[1:]
+	return pc.name, pc.hostname, true
 }
 
-// pruneExpiredPending removes pending container entries older than maxAge.
+// upsertPendingMeta stores (or overwrites) metadata for a container on the
+// given Docker network. Because the map is keyed by container name, duplicate
+// writes from multiple event sources are harmless — last-write-wins with a
+// refreshed timestamp.
+func (p *Plugin) upsertPendingMeta(networkID, name, hostname string) {
+	p.Lock()
+	defer p.Unlock()
+	m := p.pendingMeta[networkID]
+	if m == nil {
+		m = make(map[string]pendingContainer)
+		p.pendingMeta[networkID] = m
+	}
+	m[name] = pendingContainer{
+		name:      name,
+		hostname:  hostname,
+		createdAt: time.Now(),
+	}
+}
+
+// lookupPendingMeta returns cached metadata for a container on the given
+// network. Returns ("", false) when no entry exists.
+func (p *Plugin) lookupPendingMeta(networkID, name string) (hostname string, ok bool) {
+	p.RLock()
+	defer p.RUnlock()
+	m := p.pendingMeta[networkID]
+	if m == nil {
+		return "", false
+	}
+	pc, exists := m[name]
+	if !exists {
+		return "", false
+	}
+	return pc.hostname, true
+}
+
+// pruneExpiredPending removes entries older than maxAge from both the FIFO
+// queue and the metadata map.
 func (p *Plugin) pruneExpiredPending(maxAge time.Duration) {
 	p.Lock()
 	defer p.Unlock()
 	cutoff := time.Now().Add(-maxAge)
-	for netID, queue := range p.pendingByNetwork {
+
+	// Prune FIFO queue
+	for netID, queue := range p.pendingQueue {
 		fresh := queue[:0]
 		for _, pc := range queue {
-			if pc.createdAt.After(cutoff) {
+			if !pc.createdAt.Before(cutoff) {
 				fresh = append(fresh, pc)
 			}
 		}
 		if len(fresh) == 0 {
-			delete(p.pendingByNetwork, netID)
+			delete(p.pendingQueue, netID)
 		} else {
-			p.pendingByNetwork[netID] = fresh
+			p.pendingQueue[netID] = fresh
+		}
+	}
+
+	// Prune metadata map
+	for netID, m := range p.pendingMeta {
+		for name, pc := range m {
+			if pc.createdAt.Before(cutoff) {
+				delete(m, name)
+			}
+		}
+		if len(m) == 0 {
+			delete(p.pendingMeta, netID)
 		}
 	}
 }
@@ -237,9 +323,9 @@ func (p *Plugin) pruneExpiredPending(maxAge time.Duration) {
 // Docker event listener
 // ---------------------------------------------------------------------------
 
-// watchDockerEvents listens for container lifecycle events and pre-populates the
-// per-network pending queue so that CreateEndpoint can resolve the container
-// name for deterministic MAC generation and DHCP hostname registration.
+// watchDockerEvents listens for container lifecycle events and maintains the
+// per-network metadata map so that CreateEndpoint can look up cached hostname
+// info after identifying the container via findInNetwork or deep fallback.
 func (p *Plugin) watchDockerEvents(ctx context.Context) {
 	log.Info("Starting Docker event listener for container name pre-caching...")
 	msgChan, errChan := p.docker.Events(ctx, events.ListOptions{})
@@ -263,18 +349,23 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 					hostname = name
 				}
 
-				// For "create", handle the primary network.
-				// For "start", handle all networks connected to this container.
 				if msg.Action == "create" {
+					// Create events push to FIFO (forward=true) + metadata map.
+					// This is the PRIMARY source for container→CreateEndpoint matching.
 					netName := string(ctr.HostConfig.NetworkMode)
 					if netName != "" && netName != "default" && netName != "bridge" &&
 						netName != "host" && netName != "none" {
-						p.registerPendingForNetwork(ctx, netName, name, hostname)
+						p.registerPendingForNetwork(ctx, netName, name, hostname, true)
 					}
 				} else {
+					// Start events only update the metadata map — they do NOT push
+					// to the FIFO queue. Start events arrive during/after CreateEndpoint
+					// processing and would disrupt FIFO ordering by re-appending names
+					// that were already popped. During compose up, create events already
+					// populated the FIFO. During docker restart, die events provide
+					// the backward entry which fires before CreateEndpoint.
 					for netName, settings := range ctr.NetworkSettings.Networks {
-						p.registerPendingForNetwork(ctx, netName, name, hostname)
-						// Also store the endpoint mapping if we have it
+						p.registerPendingForNetworkMeta(ctx, netName, name, hostname)
 						if settings.EndpointID != "" {
 							p.cache.SetMetadata(settings.NetworkID, settings.EndpointID, ContainerMetadata{
 								Name:      name,
@@ -287,8 +378,8 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 			} else if msg.Type == "container" && msg.Action == "die" {
 				// C3: Pre-populate pending queue on container death so that a
 				// subsequent restart has the name available before CreateEndpoint.
-				// This is belt-and-suspenders with Leave pre-population (C2) —
-				// it covers cases where the cache was stale or empty.
+				// Pushed with forward=false (backward-looking) so that compose-up
+				// create events will flush these entries.
 				name := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
 				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				ctr, err := p.docker.ContainerInspect(inspectCtx, msg.Actor.ID)
@@ -304,11 +395,14 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 				}
 
 				for netName := range ctr.NetworkSettings.Networks {
-					p.registerPendingForNetwork(ctx, netName, name, hostname)
+					p.registerPendingForNetwork(ctx, netName, name, hostname, false)
 				}
 
 				log.WithField("container", name).Debug("Pre-populated pending queue from die event")
 			} else if msg.Type == "network" && msg.Action == "connect" {
+				// network.connect fires AFTER CreateEndpoint returns, so this
+				// only updates the metadata map for hostname enrichment — it does
+				// NOT push to the FIFO queue (too late to help with ordering).
 				netID := msg.Actor.ID
 				ctrID := msg.Actor.Attributes["container"]
 				log.WithFields(log.Fields{
@@ -325,7 +419,7 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 					if len(ctr.ID) >= 12 && hostname == ctr.ID[:12] {
 						hostname = name
 					}
-					p.registerPendingForNetwork(ctx, netID, name, hostname)
+					p.upsertPendingMeta(netID, name, hostname)
 				}
 			}
 		case err := <-errChan:
@@ -342,10 +436,29 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 	}
 }
 
+// registerPendingForNetworkMeta resolves a network name-or-ID to its UUID,
+// verifies it is a DHCP plugin network, and upserts the container into the
+// metadata map ONLY (no FIFO push). Used for start and network.connect events
+// which arrive too late to help with FIFO ordering.
+func (p *Plugin) registerPendingForNetworkMeta(ctx context.Context, netNameOrID, containerName, hostname string) {
+	netCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	n, err := p.docker.NetworkInspect(netCtx, netNameOrID, network.InspectOptions{})
+	cancel()
+	if err != nil {
+		return
+	}
+	if !IsDHCPPlugin(n.Driver) {
+		return
+	}
+	p.upsertPendingMeta(n.ID, containerName, hostname)
+}
+
 // registerPendingForNetwork resolves a network name-or-ID to its UUID, verifies
-// it is a DHCP plugin network, and pushes the container into the pending queue.
+// it is a DHCP plugin network, and pushes the container into both the FIFO
+// queue and metadata map. The forward flag indicates whether this is a
+// forward-looking event (create/start) or backward-looking (die/Leave).
 // Returns true on success.
-func (p *Plugin) registerPendingForNetwork(ctx context.Context, netNameOrID, containerName, hostname string) bool {
+func (p *Plugin) registerPendingForNetwork(ctx context.Context, netNameOrID, containerName, hostname string, forward bool) bool {
 	netCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	n, err := p.docker.NetworkInspect(netCtx, netNameOrID, network.InspectOptions{})
 	cancel()
@@ -356,19 +469,20 @@ func (p *Plugin) registerPendingForNetwork(ctx context.Context, netNameOrID, con
 	if !IsDHCPPlugin(n.Driver) {
 		return false
 	}
-	p.pushPendingContainer(n.ID, containerName, hostname)
+	p.pushPendingContainer(n.ID, containerName, hostname, forward)
+	p.upsertPendingMeta(n.ID, containerName, hostname)
 	log.WithFields(log.Fields{
 		"container": containerName,
 		"hostname":  hostname,
 		"network":   netNameOrID,
 		"networkID": n.ID[:12],
+		"forward":   forward,
 	}).Debug("Queued pending container for MAC seed lookup")
 	return true
 }
 
-// scavengerLoop periodically removes stale entries from the pending queue.
-// Entries older than 2 minutes are guaranteed to be uncollected (CreateEndpoint
-// runs within milliseconds of container create), so pruning them is safe.
+// scavengerLoop periodically removes stale entries from the metadata map.
+// Entries older than 2 minutes are guaranteed to be unused, so pruning is safe.
 func (p *Plugin) scavengerLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
