@@ -101,6 +101,12 @@ func (m *dhcpManager) processEvents(v6 bool, events <-chan udhcpc.Event) {
 }
 
 func (m *dhcpManager) setupClient(v6 bool) error {
+	if m.netHandle != nil && m.ctrLink != nil {
+		if link, err := m.netHandle.LinkByIndex(m.ctrLink.Attrs().Index); err == nil {
+			m.ctrLink = link
+		}
+	}
+
 	client, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
 		Hostname: m.hostname, V6: v6, Namespace: m.nsPath,
 	})

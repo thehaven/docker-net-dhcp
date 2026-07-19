@@ -112,22 +112,43 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	// event follows).
 	var seedName, hostname string
 
-	// PRIMARY: Pop from the per-network FIFO queue. The queue is populated by
-	// create/start events (forward) and die/Leave events (backward). Forward
-	// events flush backward entries on push to prevent compose-down contamination.
-	// Retry briefly to allow the event listener to process concurrent events.
-	for attempt := 0; attempt < 15; attempt++ {
-		if name, hn, ok := p.popPendingContainer(r.NetworkID); ok {
-			seedName = name
-			hostname = hn
-			reqLog.WithFields(log.Fields{
-				"container": seedName,
-				"hostname":  hostname,
-				"attempt":   attempt,
-			}).Debug("Resolved container via FIFO queue")
-			break
+	// PROACTIVE LOOKUP: Check if Docker provided a MAC address (typical on container restart/reboot)
+	// and see if we can resolve it directly from our persistent cache.
+	if r.Interface != nil && r.Interface.MacAddress != "" {
+		if state, ok := p.cache.Get(r.NetworkID); ok {
+			for _, ep := range state.Endpoints {
+				if ep.MacAddress == r.Interface.MacAddress && ep.SeedName != "" {
+					seedName = ep.SeedName
+					hostname = ep.Hostname
+					reqLog.WithFields(log.Fields{
+						"container": seedName,
+						"hostname":  hostname,
+						"mac":       r.Interface.MacAddress,
+					}).Info("Resolved container name proactively from persistent cache via MAC address")
+					break
+				}
+			}
 		}
-		time.Sleep(200 * time.Millisecond)
+	}
+
+	if seedName == "" {
+		// PRIMARY: Pop from the per-network FIFO queue. The queue is populated by
+		// create/start events (forward) and die/Leave events (backward). Forward
+		// events flush backward entries on push to prevent compose-down contamination.
+		// Retry briefly to allow the event listener to process concurrent events.
+		for attempt := 0; attempt < 15; attempt++ {
+			if name, hn, ok := p.popPendingContainer(r.NetworkID); ok {
+				seedName = name
+				hostname = hn
+				reqLog.WithFields(log.Fields{
+					"container": seedName,
+					"hostname":  hostname,
+					"attempt":   attempt,
+				}).Debug("Resolved container via FIFO queue")
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	if seedName == "" {
@@ -423,46 +444,57 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	go func() {
 		ctxBG, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := m.Start(ctxBG); err != nil { return }
+		if err := m.Start(ctxBG); err != nil {
+			reqLog.WithError(err).Error("Failed to start DHCP manager in background")
+			return
+		}
 
 		// ---------------------------------------------------------------
 		// Post-Join MAC correction
 		// ---------------------------------------------------------------
 		// Docker commits EndpointID→Container association AFTER Join
 		// returns, so ContainerList can NOW resolve the real container.
-		if hint.SeedName != "" && hint.SeedName != r.EndpointID {
-			corrCtx, corrCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			corrCtrs, corrErr := p.docker.ContainerList(corrCtx, container.ListOptions{})
-			corrCancel()
-			if corrErr == nil {
-				var actualName, actualHostname string
-				for _, c := range corrCtrs {
-					if c.NetworkSettings == nil {
-						continue
-					}
-					for _, ns := range c.NetworkSettings.Networks {
-						if ns.EndpointID == r.EndpointID {
-							if len(c.Names) > 0 {
-								actualName = strings.TrimPrefix(c.Names[0], "/")
-							}
-							inspCtx, inspCancel := context.WithTimeout(context.Background(), 2*time.Second)
-							ctr, inspErr := p.docker.ContainerInspect(inspCtx, c.ID)
-							inspCancel()
-							if inspErr == nil {
-								actualHostname = ctr.Config.Hostname
-								if len(ctr.ID) >= 12 && actualHostname == ctr.ID[:12] {
-									actualHostname = actualName
+		if true {
+			var actualName, actualHostname string
+			for attempt := 0; attempt < 10; attempt++ {
+				time.Sleep(200 * time.Millisecond)
+				corrCtx, corrCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				corrCtrs, corrErr := p.docker.ContainerList(corrCtx, container.ListOptions{All: true})
+				corrCancel()
+				if corrErr == nil {
+					for _, c := range corrCtrs {
+						if c.NetworkSettings == nil {
+							continue
+						}
+						for _, ns := range c.NetworkSettings.Networks {
+							if ns.EndpointID == r.EndpointID {
+								if len(c.Names) > 0 {
+									actualName = strings.TrimPrefix(c.Names[0], "/")
 								}
+								inspCtx, inspCancel := context.WithTimeout(context.Background(), 2*time.Second)
+								ctr, inspErr := p.docker.ContainerInspect(inspCtx, c.ID)
+								inspCancel()
+								if inspErr == nil {
+									actualHostname = ctr.Config.Hostname
+									if len(ctr.ID) >= 12 && actualHostname == ctr.ID[:12] {
+										actualHostname = actualName
+									}
+								}
+								break
 							}
+						}
+						if actualName != "" {
 							break
 						}
 					}
-					if actualName != "" {
-						break
-					}
 				}
+				if actualName != "" {
+					break
+				}
+			}
 
-				if actualName != "" && actualName != hint.SeedName {
+			if actualName != "" {
+				if actualName != hint.SeedName {
 					macFormat := macFormatFromOpts(opts)
 					correctMac, genErr := macgen.Generate(macgen.Options{Seed: actualName, Format: macFormat})
 					if genErr == nil {
@@ -478,17 +510,19 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 						}
 					}
 					hint.SeedName = actualName
-					if actualHostname != "" {
-						hint.Hostname = actualHostname
-					}
-					m.hostname = hint.Hostname
-				} else if actualName != "" {
-					reqLog.WithField("container", actualName).Debug("Post-Join: FIFO assignment confirmed correct")
-				} else {
-					reqLog.Debug("Post-Join: could not identify container via EndpointID")
 				}
+				if actualHostname != "" {
+					hint.Hostname = actualHostname
+				} else {
+					hint.Hostname = actualName
+				}
+				m.hostname = hint.Hostname
+				reqLog.WithFields(log.Fields{
+					"container": actualName,
+					"hostname":  m.hostname,
+				}).Info("Post-Join: identified container via EndpointID")
 			} else {
-				reqLog.WithError(corrErr).Warn("Post-Join: ContainerList failed")
+				reqLog.Debug("Post-Join: could not identify container via EndpointID")
 			}
 		}
 
