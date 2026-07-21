@@ -9,6 +9,53 @@ invoke the `/docker-net-dhcp` skill or read these specs:
   windows, lifecycle ordering, anti-patterns). This is ground truth from instrumented testing.
 - `docs/DETERMINISTIC-MAC-SPEC.md` — Deterministic MAC resolution design and data structures.
 
+## Invariants — DO NOT BREAK THESE
+
+These guardrails exist because each was broken at least once and caused production failures.
+
+### 1. `Reap()` must NEVER send signals
+
+`pkg/udhcpc/client.go`: `Reap()` is the wait-only companion to `Release()` (which sends SIGTERM
+for DHCPRELEASE). `Reap()` is called by `GetIP()` on Once-mode processes — if it sends any signal,
+the transient DHCP probe is killed before returning lease info, and new containers silently fail
+to acquire IPs. This was broken on 2026-07-21.
+
+**Enforcement**: `TestReapDoesNotSignal` and `TestGetIPPipeline` validate this contract.
+
+### 2. `GetIP()` event reader must synchronise with `Reap()`
+
+`GetIP()` uses `range events` (not `select` with a done channel) and waits on `readerDone` after
+`Reap()` returns. This guarantees the "bound" event is consumed before `info` is checked. A
+previous `select`/`done`-channel design had a scheduling race where `close(done)` could fire
+before the reader goroutine processed the event, causing `ErrNoLease` with fast-exiting processes.
+
+### 3. `Start()` uses buffered event channel
+
+`events := make(chan Event, 1)` (not unbuffered). Prevents the scanner goroutine from blocking
+on send before the caller's reader goroutine is scheduled. Without the buffer, the scanner
+blocks and the caller's goroutine can race past it to `Reap()`.
+
+### 4. Post-Join MAC correction must respect user-specified MACs
+
+`pkg/plugin/plugin.go`: `joinHint.UserSpecifiedMAC` is set when `r.Interface.MacAddress != ""`
+in `CreateEndpoint`. In the post-Join goroutine (`network.go`), MAC correction is skipped when
+this flag is true — the user explicitly chose a MAC and it must not be overridden. Broken on
+2026-07-21: post-Join correction unconditionally replaced user-specified MACs after FIFO
+misidentification.
+
+**Enforcement**: `TestJoinHint_UserSpecifiedMAC` in `pending_test.go`.
+
+### 5. Pre-deploy checklist (mandatory)
+
+Before copying the binary to the plugin rootfs:
+
+```bash
+go vet ./...           # must be clean
+go test -race ./...    # all tests must pass
+```
+
+The binary MUST be built with go1.26.1 and CGO_ENABLED=0 (see Build section).
+
 ## Build
 
 - Build requires `CGO_ENABLED=0` for Alpine compatibility (plugin runs in Alpine container)

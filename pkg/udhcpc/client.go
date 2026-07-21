@@ -114,7 +114,13 @@ func (c *DHCPClient) Start() (chan Event, error) {
 		return nil, err
 	}
 
-	events := make(chan Event)
+	// Buffer of 1 prevents a race in GetIP(): the scanner goroutine may
+	// send a "bound" event before the caller's reader goroutine is ready.
+	// Without the buffer, the unbuffered send blocks until a receiver is
+	// available — but if Reap() → close(done) runs first, the reader
+	// exits and the event is lost. Buffering one event decouples the
+	// producer from the consumer safely for all callers.
+	events := make(chan Event, 1)
 	go func() {
 		// Closing the channel signals to processEvents that the udhcpc process
 		// has exited (pipe EOF). Without this close, processEvents would spin
@@ -138,12 +144,38 @@ func (c *DHCPClient) Start() (chan Event, error) {
 	return events, nil
 }
 
-// Finish sends SIGTERM to udhcpc(6) and waits for it to exit.
-func (c *DHCPClient) Finish(ctx context.Context) error {
-	if !c.Opts.Once {
-		if err := c.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			return fmt.Errorf("failed to send SIGTERM to udhcpc: %w", err)
+// Reap waits for the udhcpc(6) process to exit naturally without sending any
+// signal. Used by GetIP() for transient Once-mode DHCP probes where the process
+// is expected to exit on its own — the persistent DHCP manager handles the
+// actual lease lifecycle.
+//
+// IMPORTANT: Reap must NEVER send SIGTERM. Do NOT add signal-sending logic here.
+// The GetIP() pipeline that calls this method relies on the process running to
+// completion to return lease info. Premature termination silently breaks DHCP
+// lease acquisition for new containers.
+func (c *DHCPClient) Reap(ctx context.Context) error {
+	errChan := make(chan error)
+	go func() {
+		errChan <- c.cmd.Wait()
+	}()
+
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		if c.cmd.Process != nil {
+			c.cmd.Process.Kill()
 		}
+		return ctx.Err()
+	}
+}
+
+// Release sends SIGTERM to the udhcpc(6) process to trigger a DHCPRELEASE,
+// cleanly returning the lease to the server, then waits for the process to
+// exit. Used by the persistent DHCP manager on container shutdown.
+func (c *DHCPClient) Release(ctx context.Context) error {
+	if c.cmd.Process != nil {
+		_ = c.cmd.Process.Signal(syscall.SIGTERM)
 	}
 
 	errChan := make(chan error)
@@ -177,26 +209,33 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 		return dummy, fmt.Errorf("failed to start DHCP client: %w", err)
 	}
 
+	// Read events in a goroutine. Use range-events (blocks until channel
+	// closes on EOF) rather than select-with-done to avoid a scheduling
+	// race: if Reap() returns before the reader goroutine processes the
+	// "bound" event, the old done-channel-based loop could exit before
+	// info is set.
 	var info *Info
-	done := make(chan struct{})
+	readerDone := make(chan struct{})
 	go func() {
-		for {
-			select {
-			case event := <-events:
-				switch event.Type {
-				case "bound", "renew":
-					info = &event.Data
-				}
-			case <-done:
-				return
+		defer close(readerDone)
+		for event := range events {
+			switch event.Type {
+			case "bound", "renew":
+				info = &event.Data
 			}
 		}
 	}()
-	defer close(done)
 
-	if err := client.Finish(ctx); err != nil {
+	if err := client.Reap(ctx); err != nil {
+		<-readerDone
 		return dummy, err
 	}
+
+	// Reap() returned, so the scanner goroutine has seen EOF on the
+	// process stdout and closed the events channel. range-events has
+	// exited by now. Wait for the reader goroutine to confirm before
+	// checking info to eliminate the race.
+	<-readerDone
 
 	if info == nil {
 		return dummy, util.ErrNoLease

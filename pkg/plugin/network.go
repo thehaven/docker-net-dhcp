@@ -25,11 +25,19 @@ const CLIOptionsKey string = "com.docker.network.generic"
 func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 	log.WithField("options", r.Options).Debug("CreateNetwork options")
 	opts, err := decodeOpts(r.Options[util.OptionsKeyGeneric])
-	if err != nil { return err }
-	if opts.Bridge == "" { return util.ErrBridgeRequired }
+	if err != nil {
+		return err
+	}
+	if opts.Bridge == "" {
+		return util.ErrBridgeRequired
+	}
 	link, err := netlink.LinkByName(opts.Bridge)
-	if err != nil { return fmt.Errorf("failed to lookup interface %v: %w", opts.Bridge, err) }
-	if link.Type() != "bridge" { return util.ErrNotBridge }
+	if err != nil {
+		return fmt.Errorf("failed to lookup interface %v: %w", opts.Bridge, err)
+	}
+	if link.Type() != "bridge" {
+		return util.ErrNotBridge
+	}
 
 	if !opts.IgnoreConflicts {
 		ctxNets, cancelNets := context.WithTimeout(context.Background(), 5*time.Second)
@@ -39,7 +47,9 @@ func (p *Plugin) CreateNetwork(r CreateNetworkRequest) error {
 			for _, n := range nets {
 				if IsDHCPPlugin(n.Driver) {
 					otherOpts, err := decodeOpts(n.Options)
-					if err == nil && otherOpts.Bridge == opts.Bridge && n.ID != r.NetworkID { return util.ErrBridgeUsed }
+					if err == nil && otherOpts.Bridge == opts.Bridge && n.ID != r.NetworkID {
+						return util.ErrBridgeUsed
+					}
 				}
 			}
 		}
@@ -65,9 +75,13 @@ func vethPairNames(id string) (string, string) {
 func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions, error) {
 	dummy := DHCPNetworkOptions{}
 	state, ok := p.cache.Get(id)
-	if ok { return state.Options, nil }
+	if ok {
+		return state.Options, nil
+	}
 	n, err := p.docker.NetworkInspect(ctx, id, network.InspectOptions{})
-	if err != nil { return dummy, fmt.Errorf("failed to get info from Docker: %w", err) }
+	if err != nil {
+		return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
+	}
 	opts, _ := decodeOpts(n.Options)
 	_ = p.cache.Set(NetworkState{ID: id, Options: opts})
 	return opts, nil
@@ -88,9 +102,13 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	res := CreateEndpointResponse{Interface: &EndpointInterface{}}
 
 	opts, err := p.netOptions(ctx, r.NetworkID)
-	if err != nil { return res, err }
+	if err != nil {
+		return res, err
+	}
 	bridge, err := netlink.LinkByName(opts.Bridge)
-	if err != nil { return res, err }
+	if err != nil {
+		return res, err
+	}
 
 	hostName, ctrName := vethPairNames(r.EndpointID)
 	la := netlink.NewLinkAttrs()
@@ -265,6 +283,14 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		addr, _ := net.ParseMAC(appliedMac)
 		hostLink.PeerHardwareAddr = addr
 		res.Interface.MacAddress = "" // omitempty ensures this is absent from JSON
+
+		// Persist the flag so post-Join MAC correction knows to skip.
+		p.Lock()
+		hint := p.joinHints[r.EndpointID]
+		hint.UserSpecifiedMAC = true
+		p.joinHints[r.EndpointID] = hint
+		p.Unlock()
+
 		reqLog.WithField("mac", appliedMac).Info("Using user-specified MAC")
 	} else {
 		// Deterministic MAC: seed is the container name, matching generate_mac.func.
@@ -278,7 +304,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 
 		macFormat := macFormatFromOpts(opts)
 		detMac, err := macgen.Generate(macgen.Options{Seed: seedName, Format: macFormat})
-		if err != nil { return res, fmt.Errorf("MAC generation failed: %w", err) }
+		if err != nil {
+			return res, fmt.Errorf("MAC generation failed: %w", err)
+		}
 		appliedMac = detMac
 		addr, _ := net.ParseMAC(appliedMac)
 		hostLink.PeerHardwareAddr = addr
@@ -286,12 +314,16 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		reqLog.WithField("mac", appliedMac).WithField("seed", seedName).Info("Generated deterministic MAC")
 	}
 
-	if err := netlink.LinkAdd(hostLink); err != nil { return res, err }
+	if err := netlink.LinkAdd(hostLink); err != nil {
+		return res, err
+	}
 
 	setup := func() error {
 		_ = netlink.LinkSetUp(hostLink)
 		ctrLink, err := netlink.LinkByName(ctrName)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		_ = netlink.LinkSetUp(ctrLink)
 
 		addr, _ := net.ParseMAC(appliedMac)
@@ -299,7 +331,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		_ = netlink.LinkSetMaster(hostLink, bridge)
 
 		timeout := defaultLeaseTimeout
-		if opts.LeaseTimeout != 0 { timeout = opts.LeaseTimeout }
+		if opts.LeaseTimeout != 0 {
+			timeout = opts.LeaseTimeout
+		}
 
 		// Retrieve the hostname stored above (may be empty for user-specified MAC path).
 		p.RLock()
@@ -313,16 +347,22 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 				Hostname: dhcpHostname,
 				V6:       opts.IPv6,
 			})
-			if err != nil { return err }
+			if err != nil {
+				return err
+			}
 			ip, _ := netlink.ParseAddr(info.IP)
 
 			p.Lock()
 			hint := p.joinHints[r.EndpointID]
 			if opts.IPv6 {
-				if r.Interface == nil || r.Interface.AddressIPv6 == "" { res.Interface.AddressIPv6 = info.IP }
+				if r.Interface == nil || r.Interface.AddressIPv6 == "" {
+					res.Interface.AddressIPv6 = info.IP
+				}
 				hint.IPv6 = ip
 			} else {
-				if r.Interface == nil || r.Interface.Address == "" { res.Interface.Address = info.IP }
+				if r.Interface == nil || r.Interface.Address == "" {
+					res.Interface.Address = info.IP
+				}
 				hint.IPv4 = ip
 				hint.Gateway = info.Gateway
 			}
@@ -331,8 +371,14 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return nil
 		}
 
-		if err := initialIP(false); err != nil { return err }
-		if opts.IPv6 { if err := initialIP(true); err != nil { return err } }
+		if err := initialIP(false); err != nil {
+			return err
+		}
+		if opts.IPv6 {
+			if err := initialIP(true); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -371,7 +417,9 @@ func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoRespo
 	opts, _ := p.netOptions(ctx, r.NetworkID)
 	hostName, _ := vethPairNames(r.EndpointID)
 	hostLink, err := netlink.LinkByName(hostName)
-	if err != nil { return res, err }
+	if err != nil {
+		return res, err
+	}
 	info := operInfo{Bridge: opts.Bridge, HostVEth: hostName, HostVEthMAC: hostLink.Attrs().HardwareAddr.String()}
 	_ = mapstructure.Decode(info, &res.Value)
 	return res, nil
@@ -380,27 +428,39 @@ func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoRespo
 func (p *Plugin) DeleteEndpoint(r DeleteEndpointRequest) error {
 	hostName, _ := vethPairNames(r.EndpointID)
 	link, err := netlink.LinkByName(hostName)
-	if err == nil { _ = netlink.LinkDel(link) }
+	if err == nil {
+		_ = netlink.LinkDel(link)
+	}
 	log.WithField("endpoint", r.EndpointID[:12]).Info("Endpoint deleted")
 	return nil
 }
 
 func (p *Plugin) addRoutes(opts *DHCPNetworkOptions, v6 bool, bridge netlink.Link, r JoinRequest, hint joinHint, res *JoinResponse) error {
 	family := unix.AF_INET
-	if v6 { family = unix.AF_INET6 }
+	if v6 {
+		family = unix.AF_INET6
+	}
 	routes, err := netlink.RouteListFiltered(family, &netlink.Route{
 		LinkIndex: bridge.Attrs().Index,
 		Type:      unix.RTN_UNICAST,
 	}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TYPE)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	for _, route := range routes {
 		if route.Dst == nil {
-			if family == unix.AF_INET && res.Gateway == "" { res.Gateway = route.Gw.String() }
-			if family == unix.AF_INET6 && res.GatewayIPv6 == "" { res.GatewayIPv6 = route.Gw.String() }
+			if family == unix.AF_INET && res.Gateway == "" {
+				res.Gateway = route.Gw.String()
+			}
+			if family == unix.AF_INET6 && res.GatewayIPv6 == "" {
+				res.GatewayIPv6 = route.Gw.String()
+			}
 			continue
 		}
-		if opts.SkipRoutes || route.Protocol == unix.RTPROT_KERNEL { continue }
+		if opts.SkipRoutes || route.Protocol == unix.RTPROT_KERNEL {
+			continue
+		}
 		res.StaticRoutes = append(res.StaticRoutes, &StaticRoute{
 			Destination: route.Dst.String(),
 			NextHop:     route.Gw.String(),
@@ -414,26 +474,36 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	reqLog := log.WithField("endpoint_id", r.EndpointID[:12])
 	res := JoinResponse{}
 	opts, err := p.netOptions(ctx, r.NetworkID)
-	if err != nil { return res, err }
+	if err != nil {
+		return res, err
+	}
 	_, ctrName := vethPairNames(r.EndpointID)
 	res.InterfaceName = InterfaceName{SrcName: ctrName, DstPrefix: "eth"}
 
 	p.Lock()
 	hint, ok := p.joinHints[r.EndpointID]
-	if ok { delete(p.joinHints, r.EndpointID) }
+	if ok {
+		delete(p.joinHints, r.EndpointID)
+	}
 	p.Unlock()
 
-	if !ok { return res, util.ErrNoHint }
+	if !ok {
+		return res, util.ErrNoHint
+	}
 
 	// NOTE: Docker does NOT expose EndpointID in ContainerList/Inspect until
 	// AFTER Join returns. MAC correction is deferred to the post-Join goroutine
 	// where m.Start() has completed and the endpoint association is visible.
 
-	if hint.Gateway != "" { res.Gateway = hint.Gateway }
+	if hint.Gateway != "" {
+		res.Gateway = hint.Gateway
+	}
 	bridge, err := netlink.LinkByName(opts.Bridge)
 	if err == nil {
 		_ = p.addRoutes(&opts, false, bridge, r, hint, &res)
-		if opts.IPv6 { _ = p.addRoutes(&opts, true, bridge, r, hint, &res) }
+		if opts.IPv6 {
+			_ = p.addRoutes(&opts, true, bridge, r, hint, &res)
+		}
 	}
 
 	m := newDHCPManager(p.docker, r, opts)
@@ -495,19 +565,30 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 
 			if actualName != "" {
 				if actualName != hint.SeedName {
-					macFormat := macFormatFromOpts(opts)
-					correctMac, genErr := macgen.Generate(macgen.Options{Seed: actualName, Format: macFormat})
-					if genErr == nil {
-						addr, _ := net.ParseMAC(correctMac)
-						if setErr := m.netHandle.LinkSetHardwareAddr(m.ctrLink, addr); setErr == nil {
-							reqLog.WithFields(log.Fields{
-								"old_seed": hint.SeedName,
-								"new_seed": actualName,
-								"new_mac":  correctMac,
-							}).Info("Post-Join: corrected MAC on container veth")
-						} else {
-							reqLog.WithError(setErr).Warn("Post-Join: failed to set MAC on container veth")
+					// Bug fix: do NOT override a user-specified MAC address.
+					// Docker propagates mac_address from compose files, and
+					// the post-Join correction was unconditionally replacing
+					// it with a deterministic MAC based on the corrected name.
+					if !hint.UserSpecifiedMAC {
+						macFormat := macFormatFromOpts(opts)
+						correctMac, genErr := macgen.Generate(macgen.Options{Seed: actualName, Format: macFormat})
+						if genErr == nil {
+							addr, _ := net.ParseMAC(correctMac)
+							if setErr := m.netHandle.LinkSetHardwareAddr(m.ctrLink, addr); setErr == nil {
+								reqLog.WithFields(log.Fields{
+									"old_seed": hint.SeedName,
+									"new_seed": actualName,
+									"new_mac":  correctMac,
+								}).Info("Post-Join: corrected MAC on container veth")
+							} else {
+								reqLog.WithError(setErr).Warn("Post-Join: failed to set MAC on container veth")
+							}
 						}
+					} else {
+						reqLog.WithFields(log.Fields{
+							"old_seed": hint.SeedName,
+							"new_seed": actualName,
+						}).Info("Post-Join: FIFO was wrong but user-specified MAC preserved (not overwritten)")
 					}
 					hint.SeedName = actualName
 				}
@@ -527,14 +608,18 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		}
 
 		_ = m.setupClient(false)
-		if opts.IPv6 { _ = m.setupClient(true) }
+		if opts.IPv6 {
+			_ = m.setupClient(true)
+		}
 		p.Lock()
 		p.persistentDHCP[r.EndpointID] = m
 		p.Unlock()
 
 		// Persist endpoint state including hostname for recovery after restart.
 		var ipStr string
-		if m.LastIP != nil { ipStr = m.LastIP.String() }
+		if m.LastIP != nil {
+			ipStr = m.LastIP.String()
+		}
 		ep := EndpointState{
 			ID:         r.EndpointID,
 			SandboxKey: r.SandboxKey,
@@ -566,9 +651,13 @@ func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
 
 	p.Lock()
 	manager, ok := p.persistentDHCP[r.EndpointID]
-	if ok { delete(p.persistentDHCP, r.EndpointID) }
+	if ok {
+		delete(p.persistentDHCP, r.EndpointID)
+	}
 	p.Unlock()
-	if ok { _ = manager.Stop() }
+	if ok {
+		_ = manager.Stop()
+	}
 	_ = p.cache.DeleteEndpoint(r.NetworkID, r.EndpointID)
 	return nil
 }
@@ -594,7 +683,9 @@ func (p *Plugin) resumeDHCP(ep EndpointState, opts DHCPNetworkOptions, networkID
 		defer cancel()
 		if err := m.Start(ctx); err == nil {
 			_ = m.setupClient(false)
-			if opts.IPv6 { _ = m.setupClient(true) }
+			if opts.IPv6 {
+				_ = m.setupClient(true)
+			}
 			p.Lock()
 			p.persistentDHCP[ep.ID] = m
 			p.Unlock()

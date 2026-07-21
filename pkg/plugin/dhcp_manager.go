@@ -39,9 +39,9 @@ type dhcpManager struct {
 
 func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions) *dhcpManager {
 	return &dhcpManager{
-		docker:  docker,
-		joinReq: r,
-		opts:    opts,
+		docker:   docker,
+		joinReq:  r,
+		opts:     opts,
 		stopChan: make(chan struct{}),
 	}
 }
@@ -56,14 +56,22 @@ func (m *dhcpManager) logFields(v6 bool) log.Fields {
 
 func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 	lastIP := m.LastIP
-	if v6 { lastIP = m.LastIPv6 }
+	if v6 {
+		lastIP = m.LastIPv6
+	}
 	ip, err := netlink.ParseAddr(info.IP)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	if lastIP != nil && !ip.Equal(*lastIP) {
 		log.WithFields(m.logFields(v6)).WithField("old", lastIP).WithField("new", ip).Warn("IP changed on renew")
 	}
-	if v6 { m.LastIPv6 = ip } else { m.LastIP = ip }
+	if v6 {
+		m.LastIPv6 = ip
+	} else {
+		m.LastIP = ip
+	}
 
 	if !v6 && info.Gateway != "" && m.netHandle != nil && m.ctrLink != nil {
 		newGw := net.ParseIP(info.Gateway)
@@ -127,7 +135,7 @@ func (m *dhcpManager) setupClient(v6 bool) error {
 
 			// Always clean up the current client process.
 			finCtx, finCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = cur.Finish(finCtx)
+			_ = cur.Release(finCtx)
 			finCancel()
 
 			// If Stop() was called, exit the loop.
@@ -207,19 +215,29 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	}
 
 	m.netHandle, err = netlink.NewHandleAt(m.nsHandle)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	hostName, _ := vethPairNames(m.joinReq.EndpointID)
 	hostLink, err := netlink.LinkByName(hostName)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	hostVeth, ok := hostLink.(*netlink.Veth)
-	if !ok { return util.ErrNotVEth }
+	if !ok {
+		return util.ErrNotVEth
+	}
 	ctrIndex, err := netlink.VethPeerIndex(hostVeth)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	m.ctrLink, err = util.AwaitLinkByIndex(ctx, m.netHandle, ctrIndex, pollTime)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -275,7 +293,11 @@ func (m *dhcpManager) awaitNetNS(ctx context.Context) (netns.NsHandle, error) {
 
 func (m *dhcpManager) Stop() error {
 	close(m.stopChan)
-	if m.nsHandle != 0 { m.nsHandle.Close() }
-	if m.netHandle != nil { m.netHandle.Delete() }
+	if m.nsHandle != 0 {
+		m.nsHandle.Close()
+	}
+	if m.netHandle != nil {
+		m.netHandle.Delete()
+	}
 	return nil
 }

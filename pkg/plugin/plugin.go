@@ -74,6 +74,12 @@ type joinHint struct {
 	Gateway  string
 	Hostname string // container hostname, propagated to DHCP Option 12 / Option 81
 	SeedName string // container name used as MAC seed, persisted for Leave pre-population
+
+	// UserSpecifiedMAC is true when CreateEndpoint received an explicit MAC
+	// address from Docker (e.g. a user-configured mac_address). Post-Join
+	// MAC correction MUST be skipped in this case to avoid overwriting the
+	// user's chosen hardware address.
+	UserSpecifiedMAC bool
 }
 
 // pendingContainer holds transient info about a container that has been
@@ -130,13 +136,13 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 	}
 
 	p := &Plugin{
-		awaitTimeout:     awaitTimeout,
-		docker:           client,
-		joinHints:        make(map[string]joinHint),
-		persistentDHCP:   make(map[string]*dhcpManager),
-		cache:            NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
-		pendingQueue:     make(map[string][]pendingContainer),
-		pendingMeta:      make(map[string]map[string]pendingContainer),
+		awaitTimeout:   awaitTimeout,
+		docker:         client,
+		joinHints:      make(map[string]joinHint),
+		persistentDHCP: make(map[string]*dhcpManager),
+		cache:          NewNetworkCache("/var/lib/docker-net-dhcp/networks.json"),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
 	}
 
 	// Immediate reconciliation to populate cache before recovery runs.
@@ -409,7 +415,7 @@ func (p *Plugin) watchDockerEvents(ctx context.Context) {
 					"network":   netID,
 					"container": ctrID,
 				}).Debug("Received network connect event")
-				
+
 				inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				ctr, err := p.docker.ContainerInspect(inspectCtx, ctrID)
 				cancel()

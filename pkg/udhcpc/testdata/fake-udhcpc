@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fake udhcpc for integration testing.
+# Writes a bound event to stdout (simulating a successful DHCP lease)
+# and exits cleanly. Used by TestGetIPPipeline to validate the full
+# GetIP() → Reap() pipeline without a real DHCP server.
+#
+# The JSON format must match the udhcpc-handler script output, which
+# produces events with type and data fields where data is an Info struct.
+
+echo '{"type":"bound","data":{"ip":"10.0.0.100","gateway":"10.0.0.1","domain":"example.com"}}'

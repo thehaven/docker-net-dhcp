@@ -558,3 +558,45 @@ func TestDefaultHostnameFallsBackToContainerName(t *testing.T) {
 		t.Errorf("explicit hostname got overwritten: got %q, want %q", hostname2, explicitHostname)
 	}
 }
+
+// TestJoinHint_UserSpecifiedMAC verifies that the UserSpecifiedMAC flag is
+// properly stored and retrieved from joinHints.
+func TestJoinHint_UserSpecifiedMAC(t *testing.T) {
+	p := &Plugin{
+		joinHints: make(map[string]joinHint),
+	}
+
+	endpointID := "ep-001"
+
+	// Store a hint with UserSpecifiedMAC=true (user provided MAC)
+	p.joinHints[endpointID] = joinHint{
+		SeedName:         "nginx",
+		UserSpecifiedMAC: true,
+	}
+
+	hint, ok := p.joinHints[endpointID]
+	if !ok {
+		t.Fatal("stored hint not found in joinHints")
+	}
+	if !hint.UserSpecifiedMAC {
+		t.Error("UserSpecifiedMAC should be true for user-provided MAC hint")
+	}
+	if hint.SeedName != "nginx" {
+		t.Errorf("SeedName = %q, want %q", hint.SeedName, "nginx")
+	}
+
+	// Store a hint with UserSpecifiedMAC=false (plugin-generated MAC)
+	endpointID2 := "ep-002"
+	p.joinHints[endpointID2] = joinHint{
+		SeedName:         "redis",
+		UserSpecifiedMAC: false,
+	}
+
+	hint2, ok := p.joinHints[endpointID2]
+	if !ok {
+		t.Fatal("stored hint not found in joinHints")
+	}
+	if hint2.UserSpecifiedMAC {
+		t.Error("UserSpecifiedMAC should be false for auto-generated MAC hint")
+	}
+}
