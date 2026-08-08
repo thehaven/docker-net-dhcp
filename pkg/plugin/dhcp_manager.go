@@ -87,6 +87,7 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 }
 
 func (m *dhcpManager) processEvents(v6 bool, events <-chan udhcpc.Event) {
+	collisionCount := 0
 	for {
 		select {
 		case event, ok := <-events:
@@ -98,7 +99,16 @@ func (m *dhcpManager) processEvents(v6 bool, events <-chan udhcpc.Event) {
 			}
 			switch event.Type {
 			case "bound", "renew":
+				collisionCount = 0
 				_ = m.renew(v6, event.Data)
+			case "collision":
+				collisionCount++
+				log.WithFields(m.logFields(v6)).WithField("collisions", collisionCount).Warn("DHCP address collision declined via DHCPDECLINE")
+				if collisionCount >= 3 {
+					backoff := time.Duration(collisionCount) * time.Second
+					log.WithFields(m.logFields(v6)).Warnf("Multiple DHCP collisions detected; backing off for %v", backoff)
+					time.Sleep(backoff)
+				}
 			case "deconfig", "leasefail", "nak":
 				log.WithFields(m.logFields(v6)).WithField("event", event.Type).Warn("DHCP failure event received")
 			}

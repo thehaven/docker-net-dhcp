@@ -23,10 +23,11 @@ const (
 )
 
 type DHCPClientOptions struct {
-	Hostname  string
-	V6        bool
-	Once      bool
-	Namespace string
+	Hostname   string
+	MacAddress string
+	V6         bool
+	Once       bool
+	Namespace  string
 
 	HandlerScript string
 }
@@ -62,6 +63,8 @@ func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
 		Opts: opts,
 		cmd:  cmd,
 	}
+
+
 
 	if opts.Once {
 		c.cmd.Args = append(c.cmd.Args, "-t", "5", "-T", "3", "-A", "5")

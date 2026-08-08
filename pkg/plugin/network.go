@@ -344,8 +344,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{
-				Hostname: dhcpHostname,
-				V6:       opts.IPv6,
+				Hostname:   dhcpHostname,
+				MacAddress: appliedMac,
+				V6:         opts.IPv6,
 			})
 			if err != nil {
 				return err
