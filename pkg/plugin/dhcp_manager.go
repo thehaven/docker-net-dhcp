@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -119,9 +120,21 @@ func (m *dhcpManager) processEvents(v6 bool, events <-chan udhcpc.Event) {
 }
 
 func (m *dhcpManager) setupClient(v6 bool) error {
-	if m.netHandle != nil && m.ctrLink != nil {
+	if m.ctrLink == nil {
+		return fmt.Errorf("container link is not initialized")
+	}
+
+	if m.netHandle != nil {
 		if link, err := m.netHandle.LinkByIndex(m.ctrLink.Attrs().Index); err == nil {
 			m.ctrLink = link
+		}
+	}
+
+	// Validate that the network namespace exists before launching udhcpc
+	if m.nsPath != "" {
+		if _, err := os.Stat(m.nsPath); os.IsNotExist(err) {
+			log.WithFields(m.logFields(v6)).WithField("path", m.nsPath).Warn("Container network namespace no longer exists; halting DHCP client setup")
+			return err
 		}
 	}
 
@@ -155,15 +168,30 @@ func (m *dhcpManager) setupClient(v6 bool) error {
 			default:
 			}
 
+			// Check if container netns still exists before retrying
+			if m.nsPath != "" {
+				if _, err := os.Stat(m.nsPath); os.IsNotExist(err) {
+					log.WithFields(m.logFields(v6)).WithField("path", m.nsPath).Info("Container network namespace removed; stopping DHCP retry loop")
+					return
+				}
+			}
+
 			// udhcpc exited without being asked — restart after a short back-off.
 			log.WithFields(m.logFields(v6)).Warn("DHCP client exited unexpectedly; restarting in 5 s")
 
-			// Inner retry loop: keep trying until we have a running client or are stopped.
+			// Inner retry loop: keep trying until we have a running client, netns vanishes, or stopped.
 			for {
 				select {
 				case <-m.stopChan:
 					return
 				case <-time.After(5 * time.Second):
+				}
+
+				if m.nsPath != "" {
+					if _, err := os.Stat(m.nsPath); os.IsNotExist(err) {
+						log.WithFields(m.logFields(v6)).WithField("path", m.nsPath).Info("Container network namespace removed during backoff; stopping DHCP retry loop")
+						return
+					}
 				}
 
 				newClient, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{

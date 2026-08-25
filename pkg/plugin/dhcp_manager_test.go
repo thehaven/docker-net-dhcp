@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vishvananda/netlink"
+
 	"github.com/thehaven/docker-net-dhcp/pkg/udhcpc"
 )
 
@@ -162,5 +164,21 @@ func TestProcessEventsStopsOnStopChan(t *testing.T) {
 	case <-done:
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("processEvents did not return after stopChan closed")
+	}
+}
+
+// TestDHCPManager_MissingNetNSBailsOut verifies that setupClient terminates
+// immediately without infinite retries when the container network namespace does not exist.
+func TestDHCPManager_MissingNetNSBailsOut(t *testing.T) {
+	m := &dhcpManager{
+		joinReq:  JoinRequest{EndpointID: "12345678901234567890", SandboxKey: "/tmp/nonexistent-sandbox-test"},
+		nsPath:   "/tmp/nonexistent-sandbox-test",
+		stopChan: make(chan struct{}),
+		ctrLink:  &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "test-eth0"}},
+	}
+
+	err := m.setupClient(false)
+	if err == nil {
+		t.Fatal("expected setupClient to return an error when netns is missing, got nil")
 	}
 }

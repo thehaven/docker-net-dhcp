@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -432,6 +433,21 @@ func (p *Plugin) DeleteEndpoint(r DeleteEndpointRequest) error {
 	if err == nil {
 		_ = netlink.LinkDel(link)
 	}
+
+	p.Lock()
+	manager, ok := p.persistentDHCP[r.EndpointID]
+	if ok {
+		delete(p.persistentDHCP, r.EndpointID)
+	}
+	p.Unlock()
+	if ok && manager != nil {
+		_ = manager.Stop()
+	}
+
+	if p.cache != nil {
+		_ = p.cache.DeleteEndpoint(r.NetworkID, r.EndpointID)
+	}
+
 	log.WithField("endpoint", r.EndpointID[:12]).Info("Endpoint deleted")
 	return nil
 }
@@ -674,6 +690,22 @@ func (p *Plugin) Recover(ctx context.Context) {
 }
 
 func (p *Plugin) resumeDHCP(ep EndpointState, opts DHCPNetworkOptions, networkID string) {
+	// Skip recovery if the network namespace path does not exist on disk
+	if ep.SandboxKey != "" {
+		nsPath := ep.SandboxKey
+		if !strings.HasPrefix(nsPath, "/") {
+			nsPath = fmt.Sprintf("/var/run/docker/netns/%s", ep.SandboxKey)
+		}
+		if _, err := os.Stat(nsPath); os.IsNotExist(err) {
+			log.WithFields(log.Fields{
+				"endpoint": ep.ID[:12],
+				"network":  networkID[:12],
+				"sandbox":  ep.SandboxKey,
+			}).Debug("Skipping recovery for endpoint with missing network namespace")
+			return
+		}
+	}
+
 	r := JoinRequest{NetworkID: networkID, EndpointID: ep.ID, SandboxKey: ep.SandboxKey}
 	m := newDHCPManager(p.docker, r, opts)
 	// Hostname is persisted in EndpointState; no Docker API call required.

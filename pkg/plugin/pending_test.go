@@ -600,3 +600,52 @@ func TestJoinHint_UserSpecifiedMAC(t *testing.T) {
 		t.Error("UserSpecifiedMAC should be false for auto-generated MAC hint")
 	}
 }
+
+// TestDeleteEndpoint_Cleanup verifies that DeleteEndpoint stops persistentDHCP
+// managers and purges the endpoint from the persistent cache.
+func TestDeleteEndpoint_Cleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache := NewNetworkCache(tmpDir + "/networks.json")
+	_ = cache.Set(NetworkState{ID: "net-test-123", Options: DHCPNetworkOptions{Bridge: "br0"}})
+	_ = cache.SetEndpoint("net-test-123", EndpointState{ID: "ep-test-delete", SandboxKey: "/tmp/sb"})
+
+	mgr := &dhcpManager{
+		joinReq:  JoinRequest{EndpointID: "ep-test-delete"},
+		stopChan: make(chan struct{}),
+	}
+
+	p := &Plugin{
+		cache:          cache,
+		persistentDHCP: map[string]*dhcpManager{"ep-test-delete": mgr},
+		joinHints:      make(map[string]joinHint),
+		pendingQueue:   make(map[string][]pendingContainer),
+		pendingMeta:    make(map[string]map[string]pendingContainer),
+	}
+
+	err := p.DeleteEndpoint(DeleteEndpointRequest{
+		NetworkID:  "net-test-123",
+		EndpointID: "ep-test-delete",
+	})
+	if err != nil {
+		t.Fatalf("DeleteEndpoint failed: %v", err)
+	}
+
+	p.RLock()
+	_, existsInMap := p.persistentDHCP["ep-test-delete"]
+	p.RUnlock()
+	if existsInMap {
+		t.Error("DeleteEndpoint should have removed manager from persistentDHCP map")
+	}
+
+	select {
+	case <-mgr.stopChan:
+		// Stop was called on manager
+	default:
+		t.Error("DeleteEndpoint should have stopped the dhcpManager")
+	}
+
+	_, existsInCache := p.cache.GetEndpoint("net-test-123", "ep-test-delete")
+	if existsInCache {
+		t.Error("DeleteEndpoint should have deleted the endpoint from cache")
+	}
+}

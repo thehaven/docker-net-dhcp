@@ -335,10 +335,32 @@ func (c *NetworkCache) Reconcile(ctx context.Context, dockerClient interface {
 		}
 
 		newMap := make(map[string]string)
+		activeEndpoints := make(map[string]bool)
 		for ctrID, epInfo := range n.Containers {
 			newMap[epInfo.EndpointID] = ctrID
+			if epInfo.EndpointID != "" {
+				activeEndpoints[epInfo.EndpointID] = true
+			}
 		}
 		existing.ContainerMap = newMap
+
+		// Reconcile and prune orphaned endpoints from cache
+		if existing.Endpoints != nil {
+			for epID := range existing.Endpoints {
+				if !activeEndpoints[epID] {
+					log.WithFields(log.Fields{
+						"network":  id,
+						"endpoint": epID,
+					}).Info("Pruning orphaned endpoint from network cache")
+					delete(existing.Endpoints, epID)
+					if existing.MetadataMap != nil {
+						delete(existing.MetadataMap, epID)
+					}
+					changed = true
+				}
+			}
+		}
+
 		c.networks[id] = existing
 	}
 

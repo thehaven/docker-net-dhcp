@@ -10,6 +10,7 @@ require (
 	github.com/vishvananda/netlink v1.2.1-beta.2
 	github.com/vishvananda/netns v0.0.4
 	golang.org/x/sys v0.24.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

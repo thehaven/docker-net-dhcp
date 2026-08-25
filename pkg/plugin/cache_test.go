@@ -99,4 +99,36 @@ func TestNetworkCache(t *testing.T) {
 	if !ok {
 		t.Errorf("Reconcile() incorrectly removed real network")
 	}
+
+	// Test Reconcile (Orphaned Endpoints)
+	cache.SetEndpoint("real-net", EndpointState{ID: "alive-ep", SandboxKey: "/tmp/alive"})
+	cache.SetEndpoint("real-net", EndpointState{ID: "dead-ep", SandboxKey: "/tmp/dead"})
+
+	mockDockerWithContainers := &mockDockerClient{
+		networks: []network.Inspect{
+			{
+				ID:     "real-net",
+				Driver: "ghcr.io/thehaven/docker-net-dhcp:latest",
+				Containers: map[string]network.EndpointResource{
+					"ctr-alive": {
+						EndpointID: "alive-ep",
+						Name:       "alive-container",
+					},
+				},
+			},
+		},
+		delay: 0,
+	}
+
+	cache.Reconcile(context.Background(), mockDockerWithContainers, 0)
+
+	_, ok = cache.GetEndpoint("real-net", "alive-ep")
+	if !ok {
+		t.Errorf("Reconcile() should have kept alive-ep")
+	}
+
+	_, ok = cache.GetEndpoint("real-net", "dead-ep")
+	if ok {
+		t.Errorf("Reconcile() should have pruned dead-ep")
+	}
 }

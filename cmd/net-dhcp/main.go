@@ -4,18 +4,24 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/thehaven/docker-net-dhcp/pkg/plugin"
 )
 
 var (
-	logLevel = flag.String("log", "", "log level")
-	logFile  = flag.String("logfile", "", "log file")
-	bindSock = flag.String("sock", "/run/docker/plugins/net-dhcp.sock", "bind unix socket")
+	logLevel      = flag.String("log", "", "log level")
+	logFile       = flag.String("logfile", "", "log file")
+	logMaxSize    = flag.Int("log-max-size", 0, "maximum size in megabytes before rotating log file")
+	logMaxBackups = flag.Int("log-max-backups", 0, "maximum number of old log files to retain")
+	logMaxAge     = flag.Int("log-max-age", 0, "maximum number of days to retain old log files")
+	logCompress   = flag.Bool("log-compress", true, "compress rotated log files with gzip")
+	bindSock      = flag.String("sock", "/run/docker/plugins/net-dhcp.sock", "bind unix socket")
 )
 
 func main() {
@@ -33,14 +39,54 @@ func main() {
 	}
 	log.SetLevel(level)
 
-	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			log.WithError(err).Fatal("Failed to open log file for writing")
-		}
-		defer f.Close()
+	if *logFile == "" {
+		*logFile = os.Getenv("LOG_FILE")
+	}
 
-		log.StandardLogger().Out = f
+	maxSize := 50
+	if *logMaxSize > 0 {
+		maxSize = *logMaxSize
+	} else if v, ok := os.LookupEnv("LOG_MAX_SIZE"); ok {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			maxSize = i
+		}
+	}
+
+	maxBackups := 5
+	if *logMaxBackups > 0 {
+		maxBackups = *logMaxBackups
+	} else if v, ok := os.LookupEnv("LOG_MAX_BACKUPS"); ok {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
+			maxBackups = i
+		}
+	}
+
+	maxAge := 14
+	if *logMaxAge > 0 {
+		maxAge = *logMaxAge
+	} else if v, ok := os.LookupEnv("LOG_MAX_AGE"); ok {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
+			maxAge = i
+		}
+	}
+
+	compress := *logCompress
+	if v, ok := os.LookupEnv("LOG_COMPRESS"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			compress = b
+		}
+	}
+
+	if *logFile != "" {
+		rotator := &lumberjack.Logger{
+			Filename:   *logFile,
+			MaxSize:    maxSize,
+			MaxBackups: maxBackups,
+			MaxAge:     maxAge,
+			Compress:   compress,
+		}
+		defer rotator.Close()
+		log.StandardLogger().Out = rotator
 	}
 
 	awaitTimeout := 5 * time.Second
