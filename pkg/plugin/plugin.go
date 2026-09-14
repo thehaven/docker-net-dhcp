@@ -73,7 +73,8 @@ type joinHint struct {
 	IPv6     *netlink.Addr
 	Gateway  string
 	Hostname string // container hostname, propagated to DHCP Option 12 / Option 81
-	SeedName string // container name used as MAC seed, persisted for Leave pre-population
+	SeedName string // container name, persisted for Leave pre-population
+	MACSeed  string // seed used for deterministic MAC generation (prioritizes hostname)
 
 	// UserSpecifiedMAC is true when CreateEndpoint received an explicit MAC
 	// address from Docker (e.g. a user-configured mac_address). Post-Join

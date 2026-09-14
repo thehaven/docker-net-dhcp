@@ -8,7 +8,8 @@
 ## Problem
 
 Docker's `CreateEndpoint` API does not include the container ID or name. The plugin
-must resolve the container name to generate a deterministic MAC (seed = container name)
+must resolve the container hostname (falling back to container name) to generate a deterministic MAC
+(matching Haven's `generate_mac.func` standard where seed defaults to `$(hostname)`)
 and to register DNS via DHCP Option 12/81.
 
 Additionally, Docker does NOT expose EndpointID in ContainerList/ContainerInspect until
@@ -29,7 +30,7 @@ CreateEndpoint                          Join
     │                                    │
     ├─ FIFO pop (best-effort)            ├─ Return routes/interface
     ├─ Deep fallback (if FIFO empty)     └─ Spawn goroutine ──┐
-    ├─ Generate MAC from seedName                              │
+    ├─ Generate MAC from hostname/name                         │
     ├─ Create veth + set MAC                          m.Start() succeeds
     └─ Run Phase 1 DHCP                                        │
                                                     ┌──────────┘
@@ -37,8 +38,8 @@ CreateEndpoint                          Join
                                             Post-Join correction:
                                             ├─ ContainerList (EndpointID now visible)
                                             ├─ Match EndpointID → actual container
-                                            ├─ If FIFO was wrong:
-                                            │   ├─ Regenerate MAC from actual name
+                                            ├─ If initial MAC seed was wrong:
+                                            │   ├─ Regenerate MAC from actual hostname
                                             │   └─ Set MAC on container veth (netHandle)
                                             ├─ Update hostname for DHCP
                                             └─ Start Phase 2 DHCP (uses correct MAC)

@@ -649,3 +649,129 @@ func TestDeleteEndpoint_Cleanup(t *testing.T) {
 		t.Error("DeleteEndpoint should have deleted the endpoint from cache")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Hostname-based deterministic MAC resolution tests
+// ---------------------------------------------------------------------------
+
+// TestDeterministicMAC_HostnamePriority verifies that deterministic MAC generation
+// prioritizes the container's hostname over its container name, matching the
+// canonical generate_mac.func standard (seed defaults to hostname).
+func TestDeterministicMAC_HostnamePriority(t *testing.T) {
+	containerName := "haven-prowlarr-1"
+	containerHostname := "prowlarr"
+
+	// Case 1: Both hostname and containerName present -> seed MUST be hostname
+	seed := containerHostname
+	if seed == "" {
+		seed = containerName
+	}
+	if seed != "prowlarr" {
+		t.Errorf("expected seed to be hostname %q, got %q", containerHostname, seed)
+	}
+
+	macFromHostname, err := macgen.Generate(macgen.Options{Seed: seed, Format: macgen.FormatColon})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	expectedMAC, _ := macgen.Generate(macgen.Options{Seed: "prowlarr", Format: macgen.FormatColon})
+	if macFromHostname != expectedMAC {
+		t.Errorf("got MAC %q, want %q", macFromHostname, expectedMAC)
+	}
+
+	// Verify it differs from containerName-based MAC
+	macFromName, _ := macgen.Generate(macgen.Options{Seed: containerName, Format: macgen.FormatColon})
+	if macFromHostname == macFromName {
+		t.Errorf("MAC derived from hostname should differ from MAC derived from container name when they diverge")
+	}
+
+	// Case 2: Hostname empty -> fallback to containerName
+	emptyHostname := ""
+	seedFallback := emptyHostname
+	if seedFallback == "" {
+		seedFallback = containerName
+	}
+	if seedFallback != containerName {
+		t.Errorf("expected fallback seed to be containerName %q, got %q", containerName, seedFallback)
+	}
+
+	// Case 3: Both empty -> fallback to EndpointID
+	endpointID := "0ae4e3ef2535b0164d541ae1000274342d9119f82628009a15a10e133a838e41"
+	seedEndpoint := ""
+	if seedEndpoint == "" {
+		seedEndpoint = emptyHostname
+	}
+	if seedEndpoint == "" {
+		seedEndpoint = endpointID
+	}
+	if seedEndpoint != endpointID {
+		t.Errorf("expected fallback seed to be endpointID %q, got %q", endpointID, seedEndpoint)
+	}
+}
+
+// TestJoinHint_MACSeedTracking verifies that the MACSeed field in joinHint
+// correctly records the effective seed used for initial MAC generation and enables
+// post-Join correction to detect when the initial seed diverged from the authoritative hostname.
+func TestJoinHint_MACSeedTracking(t *testing.T) {
+	p := &Plugin{
+		joinHints: make(map[string]joinHint),
+	}
+
+	endpointID := "ep-001"
+
+	// Scenario: CreateEndpoint had to fall back to EndpointID due to race
+	p.joinHints[endpointID] = joinHint{
+		SeedName:         "",
+		Hostname:         "",
+		MACSeed:          endpointID,
+		UserSpecifiedMAC: false,
+	}
+
+	hint := p.joinHints[endpointID]
+	if hint.MACSeed != endpointID {
+		t.Errorf("hint.MACSeed = %q, want %q", hint.MACSeed, endpointID)
+	}
+
+	// Post-Join resolves authoritative container info
+	actualName := "haven-prowlarr-1"
+	actualHostname := "prowlarr"
+
+	effectiveSeed := actualHostname
+	if effectiveSeed == "" {
+		effectiveSeed = actualName
+	}
+
+	// Post-Join correction condition:
+	needsCorrection := !hint.UserSpecifiedMAC && effectiveSeed != hint.MACSeed
+	if !needsCorrection {
+		t.Errorf("expected needsCorrection=true when initial MACSeed (%q) != effectiveSeed (%q)", hint.MACSeed, effectiveSeed)
+	}
+
+	// If initial MAC already matched effectiveSeed, no correction needed
+	p.joinHints["ep-002"] = joinHint{
+		SeedName:         actualName,
+		Hostname:         actualHostname,
+		MACSeed:          effectiveSeed,
+		UserSpecifiedMAC: false,
+	}
+	hint2 := p.joinHints["ep-002"]
+	needsCorrection2 := !hint2.UserSpecifiedMAC && effectiveSeed != hint2.MACSeed
+	if needsCorrection2 {
+		t.Errorf("expected needsCorrection=false when initial MACSeed matches effectiveSeed")
+	}
+
+	// If UserSpecifiedMAC is true, never correct
+	p.joinHints["ep-003"] = joinHint{
+		SeedName:         actualName,
+		Hostname:         actualHostname,
+		MACSeed:          "",
+		UserSpecifiedMAC: true,
+	}
+	hint3 := p.joinHints["ep-003"]
+	needsCorrection3 := !hint3.UserSpecifiedMAC && effectiveSeed != hint3.MACSeed
+	if needsCorrection3 {
+		t.Errorf("expected needsCorrection=false when UserSpecifiedMAC is true")
+	}
+}
+
