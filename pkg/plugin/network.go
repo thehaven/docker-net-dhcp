@@ -294,17 +294,28 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 
 		reqLog.WithField("mac", appliedMac).Info("Using user-specified MAC")
 	} else {
-		// Deterministic MAC: seed is the container name, matching generate_mac.func.
-		if seedName == "" {
+		// Deterministic MAC: prioritize hostname, matching generate_mac.func (which defaults seed to hostname).
+		// Fallback to container name (seedName), and finally EndpointID.
+		macSeed := hostname
+		if macSeed == "" {
+			macSeed = seedName
+		}
+		if macSeed == "" {
 			// Fallback: use EndpointID as seed. This is deterministic for this
-			// endpoint but will NOT match generate_mac <container-name>.
+			// endpoint but will NOT match generate_mac <hostname>.
 			// Logged at WARN so operators can detect the race.
-			seedName = r.EndpointID
-			reqLog.Warn("No pending container found for network; using EndpointID as MAC seed — container name may not match generate_mac output")
+			macSeed = r.EndpointID
+			reqLog.Warn("No pending container or hostname found for network; using EndpointID as MAC seed — may not match generate_mac output")
 		}
 
+		p.Lock()
+		hint := p.joinHints[r.EndpointID]
+		hint.MACSeed = macSeed
+		p.joinHints[r.EndpointID] = hint
+		p.Unlock()
+
 		macFormat := macFormatFromOpts(opts)
-		detMac, err := macgen.Generate(macgen.Options{Seed: seedName, Format: macFormat})
+		detMac, err := macgen.Generate(macgen.Options{Seed: macSeed, Format: macFormat})
 		if err != nil {
 			return res, fmt.Errorf("MAC generation failed: %w", err)
 		}
@@ -312,7 +323,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		addr, _ := net.ParseMAC(appliedMac)
 		hostLink.PeerHardwareAddr = addr
 		res.Interface.MacAddress = appliedMac
-		reqLog.WithField("mac", appliedMac).WithField("seed", seedName).Info("Generated deterministic MAC")
+		reqLog.WithField("mac", appliedMac).WithField("seed", macSeed).Info("Generated deterministic MAC")
 	}
 
 	if err := netlink.LinkAdd(hostLink); err != nil {
@@ -581,20 +592,25 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			}
 
 			if actualName != "" {
-				if actualName != hint.SeedName {
+				effectiveSeed := actualHostname
+				if effectiveSeed == "" {
+					effectiveSeed = actualName
+				}
+
+				if effectiveSeed != hint.MACSeed {
 					// Bug fix: do NOT override a user-specified MAC address.
 					// Docker propagates mac_address from compose files, and
 					// the post-Join correction was unconditionally replacing
 					// it with a deterministic MAC based on the corrected name.
 					if !hint.UserSpecifiedMAC {
 						macFormat := macFormatFromOpts(opts)
-						correctMac, genErr := macgen.Generate(macgen.Options{Seed: actualName, Format: macFormat})
+						correctMac, genErr := macgen.Generate(macgen.Options{Seed: effectiveSeed, Format: macFormat})
 						if genErr == nil {
 							addr, _ := net.ParseMAC(correctMac)
 							if setErr := m.netHandle.LinkSetHardwareAddr(m.ctrLink, addr); setErr == nil {
 								reqLog.WithFields(log.Fields{
-									"old_seed": hint.SeedName,
-									"new_seed": actualName,
+									"old_seed": hint.MACSeed,
+									"new_seed": effectiveSeed,
 									"new_mac":  correctMac,
 								}).Info("Post-Join: corrected MAC on container veth")
 							} else {
@@ -603,12 +619,13 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 						}
 					} else {
 						reqLog.WithFields(log.Fields{
-							"old_seed": hint.SeedName,
-							"new_seed": actualName,
+							"old_seed": hint.MACSeed,
+							"new_seed": effectiveSeed,
 						}).Info("Post-Join: FIFO was wrong but user-specified MAC preserved (not overwritten)")
 					}
-					hint.SeedName = actualName
+					hint.MACSeed = effectiveSeed
 				}
+				hint.SeedName = actualName
 				if actualHostname != "" {
 					hint.Hostname = actualHostname
 				} else {
@@ -618,6 +635,7 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 				reqLog.WithFields(log.Fields{
 					"container": actualName,
 					"hostname":  m.hostname,
+					"seed":      effectiveSeed,
 				}).Info("Post-Join: identified container via EndpointID")
 			} else {
 				reqLog.Debug("Post-Join: could not identify container via EndpointID")

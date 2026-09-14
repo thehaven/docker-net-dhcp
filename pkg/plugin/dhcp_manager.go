@@ -48,8 +48,12 @@ func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOption
 }
 
 func (m *dhcpManager) logFields(v6 bool) log.Fields {
+	epID := m.joinReq.EndpointID
+	if len(epID) > 12 {
+		epID = epID[:12]
+	}
 	return log.Fields{
-		"endpoint": m.joinReq.EndpointID[:12],
+		"endpoint": epID,
 		"sandbox":  m.joinReq.SandboxKey,
 		"is_ipv6":  v6,
 	}
@@ -66,7 +70,13 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 	}
 
 	if lastIP != nil && !ip.Equal(*lastIP) {
-		log.WithFields(m.logFields(v6)).WithField("old", lastIP).WithField("new", ip).Warn("IP changed on renew")
+		log.WithFields(m.logFields(v6)).WithField("old", lastIP).WithField("new", ip).Warn("IP changed on renew, updating interface address")
+		if m.netHandle != nil && m.ctrLink != nil {
+			_ = m.netHandle.AddrDel(m.ctrLink, lastIP)
+			if err := m.netHandle.AddrAdd(m.ctrLink, ip); err != nil {
+				_ = m.netHandle.AddrReplace(m.ctrLink, ip)
+			}
+		}
 	}
 	if v6 {
 		m.LastIPv6 = ip

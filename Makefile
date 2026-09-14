@@ -1,4 +1,4 @@
-PLUGIN_NAME ?= ghcr.io/thehaven/docker-net-dhcp
+PLUGIN_NAME ?= docker.artifactory.thehavennet.org.uk/thehaven/docker-net-dhcp
 PLUGIN_TAG ?= golang
 PLATFORMS ?= linux/amd64,linux/arm64/v8
 

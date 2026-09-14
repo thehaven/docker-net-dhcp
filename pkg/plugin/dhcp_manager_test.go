@@ -42,6 +42,35 @@ func TestDHCPManagerRenew(t *testing.T) {
 	}
 }
 
+// TestDHCPManagerRenew_IPChange verifies that when an interface receives a new IP on renew,
+// m.LastIP is updated properly.
+func TestDHCPManagerRenew_IPChange(t *testing.T) {
+	m := &dhcpManager{}
+
+	initialInfo := udhcpc.Info{
+		IP:      "192.168.107.111/24",
+		Gateway: "192.168.107.253",
+	}
+	if err := m.renew(false, initialInfo); err != nil {
+		t.Fatalf("initial renew failed: %v", err)
+	}
+	if m.LastIP.IP.String() != "192.168.107.111" {
+		t.Fatalf("LastIP = %v, want 192.168.107.111", m.LastIP)
+	}
+
+	// DHCP server assigns static IP after post-Join MAC correction
+	updatedInfo := udhcpc.Info{
+		IP:      "192.168.107.112/24",
+		Gateway: "192.168.107.253",
+	}
+	if err := m.renew(false, updatedInfo); err != nil {
+		t.Fatalf("second renew failed: %v", err)
+	}
+	if m.LastIP.IP.String() != "192.168.107.112" {
+		t.Errorf("LastIP = %v, want 192.168.107.112", m.LastIP)
+	}
+}
+
 // TestDHCPManagerProcessEvents verifies that both "bound" and "renew" events
 // update LastIP. The channel is closed after queuing both events so that
 // processEvents returns cleanly — avoiding the data race that `time.Sleep`
